@@ -73,6 +73,6 @@ npm run build:editor
 
 ## التشغيل من المصدر على Windows
 
-افتح مجلد `Windows Commands` وانقر مرتين على `Start-Warraq.cmd` للتشغيل، أو `Stop-Warraq.cmd` للإيقاف، أو `Restart-Warraq.cmd` لإعادة التشغيل. يتطلب التشغيل من المصدر Python 3.12.
+افتح مجلد `Windows Commands` وانقر مرتين على `Start-Warraq.cmd` للتشغيل، أو `Stop-Warraq.cmd` للإيقاف، أو `Restart-Warraq.cmd` لإعادة التشغيل. يتطلب التشغيل من المصدر Python 3.11 أو أحدث.
 
 يوقف `Update-Warraq.cmd` التطبيق، وينتقل إلى فرع `main`، ويسحب آخر التغييرات باستخدام Git، ثم يشغّل التطبيق من جديد. إذا فشل أمر Git، يبقى التطبيق متوقفًا وتظهر رسالة الخطأ بدل تشغيل نسخة ناقصة التحديث.
