@@ -15,6 +15,7 @@ dependencies = [
   "google-genai>=1.47,<2",
   "keyring>=25.6,<26",
   "pydantic>=2.12,<3",
+  "tzdata>=2025.2",
 ]
 
 [project.scripts]

@@ -4,6 +4,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_dependencies_include_iana_timezone_data_for_windows():
+    requirements = (ROOT / "requirements-desktop.txt").read_text(encoding="utf-8")
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "tzdata>=" in requirements
+    assert '"tzdata>=' in project
+
+
 def test_windows_installer_keeps_a_stable_upgrade_identity_and_preserves_user_data():
     installer = (ROOT / "packaging" / "windows" / "Warraq.iss").read_text(encoding="utf-8")
 
