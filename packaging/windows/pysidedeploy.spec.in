@@ -1,0 +1,36 @@
+[app]
+title = Warraq
+project_dir = .
+input_file = run_desktop.py
+exec_directory = dist
+project_file = Warraq.pyproject
+icon = waraq/assets/Warraq.ico
+
+[python]
+python_path = @PYTHON_PATH@
+packages = Nuitka==4.1.1,ordered-set,zstandard
+
+[qt]
+qml_files = waraq/qml/Main.qml,waraq/qml/RichEditor.qml
+excluded_qml_plugins = QtCharts,QtQuick3D,QtSensors,QtTest
+modules = Core,Gui,Network,OpenGL,Qml,QmlMeta,QmlModels,QmlWorkerScript,Quick,QuickControls2,QuickTemplates2,WebChannel,WebEngineCore,WebEngineQuick
+plugins = accessiblebridge,generic,iconengines,imageformats,networkaccess,networkinformation,platforminputcontexts,platforms,platformthemes,qmllint,qmltooling,scenegraph,styles,tls
+
+[android]
+wheel_pyside =
+wheel_shiboken =
+plugins =
+
+[nuitka]
+macos.permissions =
+mode = standalone
+extra_args = --quiet --noinclude-qt-translations --include-package=keyring.backends --include-data-dir=waraq/qml=waraq/qml --include-data-dir=waraq/editor=waraq/editor --include-data-files=waraq/assets/Warraq.ico=waraq/assets/Warraq.ico --windows-console-mode=disable
+
+[buildozer]
+mode = debug
+recipe_dir =
+jars_dir =
+ndk_path =
+sdk_path =
+local_libs =
+arch =

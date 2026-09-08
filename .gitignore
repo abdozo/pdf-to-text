@@ -1,0 +1,112 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.tox/
+.nox/
+/node_modules/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments and local Python settings
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+.python-version
+.direnv/
+
+# Local configuration, credentials, and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Application data and user content
+/data/
+/tmp/
+/books/
+/uploads/
+/exports/
+/output/
+/outputs/
+/generated/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.waraq-backup
+
+# Source PDF books and generated book documents
+*.pdf
+*.docx
+*.odt
+*.epub
+*.rtf
+
+# Build, package, and installer output
+/build/
+/dist/
+/release/
+/installer/
+/Warraq.app/
+*.app/
+*.dmg
+*.pkg
+*.exe
+*.msi
+*.whl
+*.egg-info/
+.eggs/
+.nuitka-cache/
+*.build/
+*.dist/
+*.onefile-build/
+
+# Generated deployment configuration with local absolute paths
+/pysidedeploy.spec
+
+# Logs, temporary files, and crash reports
+.waraq-runtime/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+*.pid
+*.crash
+
+# Editors and developer tools
+.idea/
+.vscode/
+.fleet/
+.history/
+.zed/
+.claude/
+.codex/
+.agents/
+
+# Operating system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

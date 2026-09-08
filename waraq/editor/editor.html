@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' qrc:; script-src 'self' qrc:; style-src 'self' 'unsafe-inline'; img-src data:; font-src 'self' data:; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'">
+  <style>
+    :root { color: #18203a; background: #fff; font-family: "Noto Naskh Arabic", Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { display: flex; flex-direction: column; }
+    #toolbar {
+      flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      padding: 10px 12px; border-bottom: 1px solid #dfe3ee; background: #fff;
+      direction: rtl; z-index: 2;
+    }
+    #toolbar select, #toolbar button, #toolbar input {
+      height: 32px; border: 1px solid #dfe3ee; border-radius: 7px;
+      background: #fff; color: #3f475d; font: inherit;
+    }
+    #toolbar select { padding: 0 9px; }
+    #toolbar button {
+      min-width: 32px; padding: 0 8px; cursor: pointer;
+      font-family: Arial, sans-serif; font-size: 16px;
+    }
+    #toolbar button:hover, #toolbar button.active {
+      color: #6256d9; border-color: #8f86e8; background: #f1efff;
+    }
+    #toolbar input[type="color"] { width: 32px; padding: 3px; cursor: pointer; }
+    #editor-shell { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: hidden; }
+    #editor { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+    .tiptap {
+      width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0;
+      padding: 18px 20px 100px; overflow-y: auto; overflow-x: hidden;
+      overflow-wrap: anywhere; outline: none; direction: rtl; text-align: right;
+      white-space: pre-wrap; line-height: 1.75; font-size: 18px;
+      color: #18203a; caret-color: #6256d9;
+    }
+    .tiptap > * { max-width: 100%; margin-top: 0; margin-bottom: 0; }
+    .tiptap p.is-editor-empty:first-child::before {
+      content: "اكتب نص الصفحة هنا…"; color: #8a91a3;
+      float: right; height: 0; pointer-events: none;
+    }
+    .tiptap blockquote {
+      border-right: 4px solid #6256d9; margin: 8px 0;
+      padding: 4px 14px 4px 0; color: #4a5268;
+    }
+    .tiptap ol, .tiptap ul { padding-right: 1.5em; padding-left: 0; }
+    .tiptap li p { margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="toolbar" role="toolbar" aria-label="أدوات تنسيق النص">
+    <select id="heading" title="العنوان" aria-label="العنوان">
+      <option value="0">نص عادي</option><option value="1">عنوان رئيسي</option><option value="2">عنوان فرعي</option>
+      <option value="3">عنوان صغير</option><option value="4">عنوان رابع</option><option value="5">عنوان خامس</option><option value="6">عنوان سادس</option>
+    </select>
+    <select id="font-family" title="الخط" aria-label="الخط">
+      <option value="">الخط الافتراضي</option><option value="Noto Naskh Arabic">نسخ عربي</option><option value="Arial">آريال</option><option value="IBM Plex Sans Arabic">بلكس عربي</option>
+    </select>
+    <select id="font-size" title="حجم الخط" aria-label="حجم الخط">
+      <option value="">عادي</option><option value="13px">صغير</option><option value="27px">كبير</option><option value="45px">كبير جدًا</option>
+    </select>
+    <button type="button" data-action="bold" title="عريض" aria-label="عريض"><strong>B</strong></button>
+    <button type="button" data-action="italic" title="مائل" aria-label="مائل"><em>I</em></button>
+    <button type="button" data-action="underline" title="تحته خط" aria-label="تحته خط"><u>U</u></button>
+    <button type="button" data-action="strike" title="يتوسطه خط" aria-label="يتوسطه خط"><s>S</s></button>
+    <button type="button" data-action="blockquote" title="اقتباس" aria-label="اقتباس">❞</button>
+    <button type="button" data-action="orderedList" title="قائمة مرقمة" aria-label="قائمة مرقمة">1.</button>
+    <button type="button" data-action="bulletList" title="قائمة نقطية" aria-label="قائمة نقطية">•</button>
+    <button type="button" data-action="subscript" title="نص منخفض" aria-label="نص منخفض">x₂</button>
+    <button type="button" data-action="superscript" title="نص مرتفع" aria-label="نص مرتفع">x²</button>
+    <label title="لون النص"><input id="text-color" type="color" value="#18203a" aria-label="لون النص"></label>
+    <label title="لون الخلفية"><input id="background-color" type="color" value="#fff1a8" aria-label="لون الخلفية"></label>
+    <select id="alignment" title="المحاذاة" aria-label="المحاذاة"><option value="right">يمين</option><option value="center">وسط</option><option value="justify">ضبط</option></select>
+    <button type="button" data-action="clear" title="إزالة التنسيق" aria-label="إزالة التنسيق">Tx</button>
+  </div>
+  <div id="editor-shell"><div id="editor"></div></div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="editor.bundle.js"></script>
+</body>
+</html>

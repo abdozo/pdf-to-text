@@ -1,0 +1,27 @@
+{
+  "files": [
+    "run_desktop.py",
+    "waraq/__init__.py",
+    "waraq/__main__.py",
+    "waraq/app.py",
+    "waraq/backup.py",
+    "waraq/bridge.py",
+    "waraq/database.py",
+    "waraq/exporter.py",
+    "waraq/gemini_client.py",
+    "waraq/image_provider.py",
+    "waraq/models.py",
+    "waraq/paths.py",
+    "waraq/pdf.py",
+    "waraq/richtext.py",
+    "waraq/secrets.py",
+    "waraq/tasks.py",
+    "waraq/qml/Main.qml",
+    "waraq/qml/RichEditor.qml",
+    "waraq/editor/editor.html",
+    "waraq/editor/editor.bundle.js",
+    "waraq/editor/THIRD-PARTY-LICENSES.txt",
+    "waraq/assets/Warraq.icns",
+    "waraq/assets/Warraq.ico"
+  ]
+}

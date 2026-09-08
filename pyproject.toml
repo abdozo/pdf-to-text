@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "waraq-desktop"
+version = "0.1.0"
+description = "Arabic PDF transcription and review desktop application"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.9,<7",
+  "pypdfium2>=5.0,<6",
+  "Pillow>=12,<13",
+  "python-docx>=1.2,<2",
+  "google-genai>=1.47,<2",
+  "keyring>=25.6,<26",
+  "pydantic>=2.12,<3",
+]
+
+[project.scripts]
+waraq = "waraq.app:main"
+
+[tool.setuptools.packages.find]
+include = ["waraq*"]
+
+[tool.setuptools.package-data]
+waraq = ["qml/*.qml", "assets/*", "editor/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_desktop"]
