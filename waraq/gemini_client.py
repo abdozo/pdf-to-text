@@ -105,6 +105,11 @@ class GeminiClient:
             raise RuntimeError("حزمة Google Gen AI غير مثبتة") from exc
         self.client = genai.Client(api_key=self.api_key)
 
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
     def list_models(self) -> list[dict[str, Any]]:
         try:
             pager = self.client.models.list(config={"page_size": 1000})

@@ -219,7 +219,6 @@ ApplicationWindow {
         function commitValue() {
             const parsed = valueFromText(contentItem.text, locale)
             value = Math.max(from, Math.min(to, parsed))
-            contentItem.text = textFromValue(value, locale)
             return value
         }
         contentItem: TextInput {
@@ -287,6 +286,7 @@ ApplicationWindow {
     }
 
     function prepareConversion(startPage, endPage, overwrite) {
+        conversionScreen.rangePrepared = true
         fromPage.value = startPage
         toPage.value = endPage
         overwriteBox.checked = overwrite
@@ -298,8 +298,17 @@ ApplicationWindow {
         name = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "-").replace(/[. ]+$/g, "").trim()
         if (!name) name = "كتاب"
         if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name)) name = "_" + name
-        if (!name.toLowerCase().endsWith(".docx")) name += ".docx"
+        const suffix = exportFormat.currentIndex === 1 ? ".md" : exportFormat.currentIndex === 2 ? ".html" : ".docx"
+        if (!name.toLowerCase().endsWith(suffix)) name += suffix
         return name
+    }
+
+    function selectedExportFormat() {
+        return exportFormat.currentIndex === 1 ? "markdown" : exportFormat.currentIndex === 2 ? "html" : "word"
+    }
+
+    function selectedExportLabel() {
+        return exportFormat.currentIndex === 1 ? "Markdown" : exportFormat.currentIndex === 2 ? "HTML" : "Word"
     }
 
     function chooseExportDestination() {
@@ -424,6 +433,50 @@ ApplicationWindow {
             }
         }
     }
+    Dialog {
+        id: resetPageDialog
+        objectName: "resetPageDialog"
+        parent: Overlay.overlay
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        width: Math.min(540, parent.width - 48)
+        modal: true
+        title: "إعادة نص الصفحة"
+        closePolicy: Popup.CloseOnEscape
+        contentItem: ColumnLayout {
+            spacing: 18
+            Text {
+                Layout.fillWidth: true
+                text: "سيُحذف تعديلك الحالي في الصفحة "
+                    + latinNumber(App.currentPage.number || "")
+                    + "، ويعود النص إلى آخر تحويل وصل من الذكاء الاصطناعي."
+                color: themeColors.ink
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "لن تتأثر أي صفحة أخرى."
+                color: themeColors.muted
+                font.pixelSize: 13
+                wrapMode: Text.WordWrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                GhostButton { text: "إلغاء"; onClicked: resetPageDialog.close() }
+                AppButton {
+                    objectName: "confirmResetPageButton"
+                    text: "إعادة النص"
+                    fill: themeColors.orange
+                    onClicked: {
+                        resetPageDialog.close()
+                        App.resetCurrentPageToExtraction()
+                    }
+                }
+            }
+        }
+    }
     FileDialog {
         id: backupSaveDialog
         title: "حفظ النسخة الاحتياطية"
@@ -440,10 +493,14 @@ ApplicationWindow {
     FileDialog {
         id: exportDialog
         objectName: "exportDialog"
-        title: "حفظ ملف Word"
+        title: "حفظ ملف " + selectedExportLabel()
         fileMode: FileDialog.SaveFile
-        defaultSuffix: "docx"
-        nameFilters: ["Word document (*.docx)"]
+        defaultSuffix: exportFormat.currentIndex === 1 ? "md" : exportFormat.currentIndex === 2 ? "html" : "docx"
+        nameFilters: exportFormat.currentIndex === 1
+            ? ["Markdown document (*.md)"]
+            : exportFormat.currentIndex === 2
+                ? ["HTML document (*.html)"]
+                : ["Word document (*.docx)"]
         onAccepted: {
             exportPath.text = selectedFile.toString()
         }
@@ -468,7 +525,7 @@ ApplicationWindow {
             spacing: 16
             Text {
                 Layout.fillWidth: true
-                text: "سيُنشئ ورّاق ملف Word من الصفحات المولّدة داخل النطاق المحدد."
+                text: "سيُنشئ ورّاق ملف " + selectedExportLabel() + " من الصفحات المولّدة داخل النطاق المحدد."
                 color: themeColors.ink
                 font.pixelSize: 15
                 wrapMode: Text.WordWrap
@@ -528,6 +585,7 @@ ApplicationWindow {
                             start_page: exportConfirmationDialog.startPage,
                             end_page: exportConfirmationDialog.endPage,
                             destination: exportPath.text,
+                            format: selectedExportFormat(),
                             include_unreviewed: includeUnreviewedPages.checked
                         }))
                     }
@@ -818,8 +876,46 @@ ApplicationWindow {
                 Item {
                     id: conversionScreen
                     property string requestedModelKey: ""
+                    property string preparedTaskModelId: ""
+                    property bool rangePrepared: false
                     property var selectedBook: convertBook.currentIndex >= 0 && App.books[convertBook.currentIndex]
                         ? App.books[convertBook.currentIndex] : App.currentBook
+                    function indexForValue(items, field, value) {
+                        for (let index = 0; index < items.length; index++) {
+                            if (items[index][field] === value) return index
+                        }
+                        return -1
+                    }
+                    function selectPreparedTaskModel() {
+                        if (!preparedTaskModelId) return
+                        const index = indexForValue(modelBox.model, "id", preparedTaskModelId)
+                        if (index >= 0) modelBox.currentIndex = index
+                        if (!App.busy && App.models.length > 0) preparedTaskModelId = ""
+                    }
+                    function prepareFromTask() {
+                        const task = App.currentTask
+                        if (!task.id) return
+                        rangePrepared = true
+                        requestedModelKey = ""
+                        preparedTaskModelId = task.model || ""
+                        App.openBook(task.book_id)
+                        fromPage.value = task.start_page
+                        toPage.value = task.end_page
+                        overwriteBox.checked = false
+                        pagesPerRequest.value = task.pages_per_request || 1
+                        manuscriptMode.checked = task.mode === "manuscript"
+                        keyBox.currentIndex = indexForValue(App.keys, "id", task.key_id)
+                        promptBox.currentIndex = indexForValue(App.prompts, "id", task.prompt_id)
+                        dpiBox.currentIndex = indexForValue(dpiBox.model, "value", task.dpi)
+                        App.go("convert")
+                        Qt.callLater(selectPreparedTaskModel)
+                    }
+                    function initializeRange() {
+                        const book = selectedBook || {}
+                        const start = book.last_page || 1
+                        fromPage.value = Math.max(1, Math.min(start, book.page_count || 9999))
+                        toPage.value = Math.max(fromPage.value, Math.min(fromPage.value + 9, book.page_count || 9999))
+                    }
                     function loadModels(force) {
                         if (App.screen !== "convert" || keyBox.currentIndex < 0 || !keyBox.model[keyBox.currentIndex]) return
                         const keyId = keyBox.model[keyBox.currentIndex].id
@@ -827,7 +923,19 @@ ApplicationWindow {
                         requestedModelKey = keyId
                         App.refreshModels(keyId)
                     }
-                    onVisibleChanged: if (visible) Qt.callLater(function() { conversionScreen.loadModels(false) })
+                    onVisibleChanged: if (visible) Qt.callLater(function() {
+                        if (!conversionScreen.rangePrepared) conversionScreen.initializeRange()
+                        conversionScreen.rangePrepared = false
+                        conversionScreen.loadModels(false)
+                        conversionScreen.selectPreparedTaskModel()
+                    })
+                    Connections {
+                        target: App
+                        function onStateChanged() {
+                            if (conversionScreen.visible && conversionScreen.preparedTaskModelId)
+                                Qt.callLater(conversionScreen.selectPreparedTaskModel)
+                        }
+                    }
                     Flickable { anchors.fill: parent; contentWidth: width; contentHeight: conversionColumn.implicitHeight + 70; clip: true
                         ColumnLayout {
                             id: conversionColumn
@@ -863,9 +971,9 @@ ApplicationWindow {
                                         }
                                     }
                                     FieldLabel { text: "من صفحة PDF" }
-                                    AppSpinBox { id: fromPage; objectName: "conversionFromPage"; Layout.fillWidth: true; from: 1; to: conversionScreen.selectedBook.page_count || 9999; value: conversionScreen.selectedBook.last_page || 1; editable: true }
+                                    AppSpinBox { id: fromPage; objectName: "conversionFromPage"; Layout.fillWidth: true; from: 1; to: conversionScreen.selectedBook.page_count || 9999; value: 1; editable: true }
                                     FieldLabel { text: "إلى صفحة PDF" }
-                                    AppSpinBox { id: toPage; objectName: "conversionToPage"; Layout.fillWidth: true; from: 1; to: conversionScreen.selectedBook.page_count || 9999; value: Math.min((conversionScreen.selectedBook.last_page || 1) + 9, to); editable: true }
+                                    AppSpinBox { id: toPage; objectName: "conversionToPage"; Layout.fillWidth: true; from: 1; to: conversionScreen.selectedBook.page_count || 9999; value: 1; editable: true }
                                     FieldLabel { text: "مفتاح Gemini" }
                                     AppComboBox { id: keyBox; Layout.fillWidth: true; model: App.keys; textRole: "name"; onCurrentIndexChanged: conversionScreen.loadModels(false) }
                                     FieldLabel { text: "نموذج Gemini" }
@@ -1080,10 +1188,22 @@ ApplicationWindow {
                                     AppButton { visible: App.currentTask.state === "running" && !App.currentTask.control_action; text: "تعليق بعد الدفعة الحالية"; fill: themeColors.orange; onClicked: App.pauseTask() }
                                     AppButton { visible: ["paused","interrupted","failed"].includes(App.currentTask.state); text: "استئناف"; onClicked: App.resumeTask() }
                                     AppButton { visible: App.currentTask.state === "completed_with_errors"; text: "إعادة محاولة الصفحات الفاشلة"; onClicked: App.resumeTask() }
+                                    GhostButton {
+                                        objectName: "editFailedTaskSettingsButton"
+                                        visible: taskScreen.conversionHasErrors
+                                        text: "تعديل الإعدادات"
+                                        fill: themeColors.violet
+                                        foregroundColor: themeColors.violet
+                                        onClicked: conversionScreen.prepareFromTask()
+                                    }
                                     AppButton { visible: ["queued","running","paused","interrupted","failed","completed_with_errors"].includes(App.currentTask.state) && App.currentTask.control_action !== "cancel"; text: "إلغاء المهمة"; fill: themeColors.red; onClicked: App.cancelTask() }
+                                    Item { Layout.fillWidth: true }
+                                }
+                                RowLayout { Layout.fillWidth: true
                                     AppButton { visible: ["completed","completed_with_errors"].includes(App.currentTask.state) || (App.currentTask.completed || 0) > 0; text: "مراجعة الصفحة المحوّلة"; fill: themeColors.mint; onClicked: App.openTaskPage() }
                                     GhostButton { text: "العودة إلى الكتاب"; onClicked: App.go("book") }
                                     GhostButton { text: "عرض السجل"; onClicked: App.go("requests") }
+                                    Item { Layout.fillWidth: true }
                                 }
                             }
                         }
@@ -1195,6 +1315,16 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         Text { text: "النص"; color: themeColors.ink; font.pixelSize: 17; font.weight: Font.DemiBold }
                                         Item { Layout.fillWidth: true }
+                                        GhostButton {
+                                            objectName: "resetPageTextButton"
+                                            text: "إعادة النص الأصلي"
+                                            implicitHeight: 32
+                                            leftPadding: 11; rightPadding: 11
+                                            enabled: App.currentPage.can_reset_to_extraction || false
+                                            ToolTip.visible: hovered
+                                            ToolTip.text: "إلغاء تعديلات هذه الصفحة والعودة إلى آخر تحويل"
+                                            onClicked: resetPageDialog.open()
+                                        }
                                         Text { text: "يُحفظ تلقائيًا"; color: themeColors.muted; font.pixelSize: 11 }
                                     }
                                     Rectangle { Layout.fillWidth: true; height: 1; color: themeColors.border }
@@ -1295,7 +1425,7 @@ ApplicationWindow {
                     RowLayout { anchors.fill:parent; anchors.margins:28; spacing:18
                         Card { Layout.preferredWidth:210; Layout.fillHeight:true
                             ColumnLayout { anchors.fill:parent; anchors.margins:12
-                                Repeater { model:["مفاتيح Gemini","البرومبتات","النسخ الاحتياطي"]
+                                Repeater { model:["مفاتيح Gemini","البرومبتات","التنبيهات","النسخ الاحتياطي"]
                                     delegate: Button { required property string modelData; required property int index; Layout.fillWidth:true; height:46; text:modelData; onClicked:settingsScreen.tab=index; background:Rectangle{radius:10;color:settingsScreen.tab===index?themeColors.violetSoft:"transparent"} contentItem:Text{text:parent.text;color:settingsScreen.tab===index?themeColors.violet:themeColors.ink;verticalAlignment:Text.AlignVCenter;font.weight:settingsScreen.tab===index?Font.DemiBold:Font.Normal} HoverHandler{cursorShape:Qt.PointingHandCursor} }
                                 }
                                 Item{Layout.fillHeight:true}
@@ -1349,6 +1479,81 @@ ApplicationWindow {
                                 } }
                                 Card{Layout.fillWidth:true;Layout.preferredHeight:260;ColumnLayout{anchors.fill:parent;anchors.margins:18;FieldLabel{text:"نسخة مخصصة جديدة"}AppTextField{id:newPromptName;objectName:"newPromptName";Layout.fillWidth:true;placeholderText:"اسم النسخة"}AppComboBox{id:newPromptMode;Layout.fillWidth:true;model:[{id:"printed",name:"مطبوع"},{id:"manuscript",name:"مخطوط"}];textRole:"name"}AppTextArea{id:newPromptText;objectName:"newPromptText";Layout.fillWidth:true;Layout.fillHeight:true;placeholderText:"تعليمات القراءة";wrapMode:TextEdit.Wrap}AppButton{text:"حفظ النسخة";onClicked:App.savePrompt("",newPromptName.text,newPromptMode.model[newPromptMode.currentIndex].id,newPromptText.text)}}}
                             } }
+                            ColumnLayout {
+                                spacing: 16
+                                SectionTitle { text: "التنبيهات" }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "يمكن لورّاق تشغيل صوت من نظام التشغيل عند اكتمال التحويل أو فشله أو إلغائه. لا تُنزّل أصوات ولا تُضاف ملفات صوتية إلى التطبيق."
+                                    color: themeColors.muted
+                                    wrapMode: Text.WordWrap
+                                }
+                                Card {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: notificationSoundForm.implicitHeight + 40
+                                    ColumnLayout {
+                                        id: notificationSoundForm
+                                        anchors.fill: parent
+                                        anchors.margins: 20
+                                        spacing: 16
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            ColumnLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 4
+                                                FieldLabel { text: "صوت تنبيهات التحويل" }
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: "يشمل الاكتمال مع وجود صفحات تحتاج إعادة المحاولة."
+                                                    color: themeColors.muted
+                                                    font.pixelSize: 12
+                                                    wrapMode: Text.WordWrap
+                                                }
+                                            }
+                                            Switch {
+                                                objectName: "notificationSoundSwitch"
+                                                checked: App.notificationSoundEnabled
+                                                onToggled: App.setNotificationSoundEnabled(checked)
+                                            }
+                                        }
+                                        Rectangle { Layout.fillWidth: true; height: 1; color: themeColors.border }
+                                        GridLayout {
+                                            Layout.fillWidth: true
+                                            columns: 2
+                                            columnSpacing: 16
+                                            rowSpacing: 10
+                                            FieldLabel { text: "الصوت" }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                AppComboBox {
+                                                    id: notificationSoundBox
+                                                    objectName: "notificationSoundBox"
+                                                    Layout.fillWidth: true
+                                                    model: App.notificationSounds
+                                                    textRole: "name"
+                                                    valueRole: "id"
+                                                    enabled: App.notificationSoundEnabled
+                                                    currentIndex: {
+                                                        for (let index = 0; index < App.notificationSounds.length; index++) {
+                                                            if (App.notificationSounds[index].id === App.notificationSoundId)
+                                                                return index
+                                                        }
+                                                        return 0
+                                                    }
+                                                    onActivated: App.setNotificationSound(currentValue)
+                                                }
+                                                GhostButton {
+                                                    objectName: "previewNotificationSoundButton"
+                                                    text: "معاينة"
+                                                    enabled: App.notificationSoundEnabled
+                                                    onClicked: App.previewNotificationSound()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Item { Layout.fillHeight: true }
+                            }
                             ColumnLayout { spacing:16; SectionTitle{text:"النسخ الاحتياطي"} Text{Layout.fillWidth:true;text:"تتضمن النسخة قاعدة البيانات والنصوص والإعدادات، ولا تتضمن ملفات PDF الأصلية. يحتفظ ورّاق بنسخة أمان تلقائية قبل الاستعادة.";color:themeColors.muted;wrapMode:Text.WordWrap} Card{Layout.fillWidth:true;height:180;Column{anchors.centerIn:parent;spacing:12;AppButton{text:"إنشاء نسخة احتياطية";onClicked:backupSaveDialog.open()}GhostButton{text:"استعادة نسخة";onClicked:backupOpenDialog.open()}}} Item{Layout.fillHeight:true} }
                         }
                     }
@@ -1356,10 +1561,11 @@ ApplicationWindow {
 
                 // Export
                 Item { ColumnLayout { width:Math.min(820,stack.width-80); anchors.centerIn:parent; spacing:18
-                    SectionTitle{text:"تصدير إلى Word"}
-                    Text{Layout.fillWidth:true;text:"اختر نطاق الصفحات ومكان الحفظ. يصدّر ورّاق الصفحات المولّدة فقط، وستختار عند التأكيد إن كنت تريد تضمين الصفحات غير المعتمدة.";color:themeColors.muted;wrapMode:Text.WordWrap}
+                    SectionTitle{text:"تصدير الكتاب"}
+                    Text{Layout.fillWidth:true;text:"اختر الصيغة ونطاق الصفحات ومكان الحفظ. ملف HTML يعمل ككتاب تفاعلي مستقل، مع تنقّل مباشر وبحث يعرض رقم الصفحة لكل نتيجة.";color:themeColors.muted;wrapMode:Text.WordWrap}
                     Card { Layout.fillWidth:true; Layout.preferredHeight:exportForm.implicitHeight+50
                         GridLayout { id:exportForm; anchors.fill:parent;anchors.margins:24;columns:2;rowSpacing:13;columnSpacing:16
+                            FieldLabel{text:"الصيغة"}AppComboBox{id:exportFormat;objectName:"exportFormat";Layout.fillWidth:true;model:["Word (.docx)", "Markdown (.md)", "HTML تفاعلي (.html)"];onCurrentIndexChanged:exportPath.text=""}
                             FieldLabel{text:"من صفحة"}AppSpinBox{id:exportFrom;Layout.fillWidth:true;from:1;to:App.currentBook.page_count||1;value:1;editable:true}
                             FieldLabel{text:"إلى صفحة"}AppSpinBox{id:exportTo;Layout.fillWidth:true;from:1;to:App.currentBook.page_count||1;value:App.currentBook.page_count||1;editable:true}
                             FieldLabel{text:"الملف"}RowLayout{Layout.fillWidth:true;AppTextField{id:exportPath;objectName:"exportPath";Layout.fillWidth:true;readOnly:true;placeholderText:"اختر مكان الحفظ"}GhostButton{objectName:"chooseExportDestinationButton";text:"اختيار مكان الحفظ";onClicked:chooseExportDestination()}}

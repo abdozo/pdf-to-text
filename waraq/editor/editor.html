@@ -27,12 +27,15 @@
       color: #6256d9; border-color: #8f86e8; background: #f1efff;
     }
     #toolbar input[type="color"] { width: 32px; padding: 3px; cursor: pointer; }
+    .markdown-only { display: none; }
+    body[data-content-mode="markdown"] .html-only { display: none; }
+    body[data-content-mode="markdown"] .markdown-only { display: inline-flex; }
     #editor-shell { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: hidden; }
     #editor { width: 100%; height: 100%; min-width: 0; min-height: 0; }
     .tiptap {
       width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0;
       padding: 18px 20px 100px; overflow-y: auto; overflow-x: hidden;
-      overflow-wrap: anywhere; outline: none; direction: rtl; text-align: right;
+      overflow-wrap: break-word; word-break: normal; outline: none; direction: rtl; text-align: right;
       white-space: pre-wrap; line-height: 1.75; font-size: 18px;
       color: #18203a; caret-color: #6256d9;
     }
@@ -45,6 +48,14 @@
       border-right: 4px solid #6256d9; margin: 8px 0;
       padding: 4px 14px 4px 0; color: #4a5268;
     }
+    body[data-content-mode="markdown"] .tiptap h2,
+    body[data-content-mode="markdown"] .tiptap h3,
+    body[data-content-mode="markdown"] .tiptap h4,
+    body[data-content-mode="markdown"] .tiptap h5,
+    body[data-content-mode="markdown"] .tiptap h6 { text-align: center; }
+    body[data-content-mode="markdown"] .tiptap blockquote {
+      border: 0; margin: 0; padding: 0; color: inherit; font-size: 13px;
+    }
     .tiptap ol, .tiptap ul { padding-right: 1.5em; padding-left: 0; }
     .tiptap li p { margin: 0; }
   </style>
@@ -52,28 +63,29 @@
 <body>
   <div id="toolbar" role="toolbar" aria-label="أدوات تنسيق النص">
     <select id="heading" title="العنوان" aria-label="العنوان">
-      <option value="0">نص عادي</option><option value="1">عنوان رئيسي</option><option value="2">عنوان فرعي</option>
+      <option value="0">نص عادي</option><option value="2">عنوان رئيسي</option>
       <option value="3">عنوان صغير</option><option value="4">عنوان رابع</option><option value="5">عنوان خامس</option><option value="6">عنوان سادس</option>
     </select>
-    <select id="font-family" title="الخط" aria-label="الخط">
+    <select id="font-family" class="html-only" title="الخط" aria-label="الخط">
       <option value="">الخط الافتراضي</option><option value="Noto Naskh Arabic">نسخ عربي</option><option value="Arial">آريال</option><option value="IBM Plex Sans Arabic">بلكس عربي</option>
     </select>
-    <select id="font-size" title="حجم الخط" aria-label="حجم الخط">
+    <select id="font-size" class="html-only" title="حجم الخط" aria-label="حجم الخط">
       <option value="">عادي</option><option value="13px">صغير</option><option value="27px">كبير</option><option value="45px">كبير جدًا</option>
     </select>
     <button type="button" data-action="bold" title="عريض" aria-label="عريض"><strong>B</strong></button>
     <button type="button" data-action="italic" title="مائل" aria-label="مائل"><em>I</em></button>
-    <button type="button" data-action="underline" title="تحته خط" aria-label="تحته خط"><u>U</u></button>
+    <button type="button" class="html-only" data-action="underline" title="تحته خط" aria-label="تحته خط"><u>U</u></button>
     <button type="button" data-action="strike" title="يتوسطه خط" aria-label="يتوسطه خط"><s>S</s></button>
     <button type="button" data-action="blockquote" title="اقتباس" aria-label="اقتباس">❞</button>
     <button type="button" data-action="orderedList" title="قائمة مرقمة" aria-label="قائمة مرقمة">1.</button>
     <button type="button" data-action="bulletList" title="قائمة نقطية" aria-label="قائمة نقطية">•</button>
-    <button type="button" data-action="subscript" title="نص منخفض" aria-label="نص منخفض">x₂</button>
-    <button type="button" data-action="superscript" title="نص مرتفع" aria-label="نص مرتفع">x²</button>
-    <label title="لون النص"><input id="text-color" type="color" value="#18203a" aria-label="لون النص"></label>
-    <label title="لون الخلفية"><input id="background-color" type="color" value="#fff1a8" aria-label="لون الخلفية"></label>
-    <select id="alignment" title="المحاذاة" aria-label="المحاذاة"><option value="right">يمين</option><option value="center">وسط</option><option value="justify">ضبط</option></select>
+    <button type="button" class="html-only" data-action="subscript" title="نص منخفض" aria-label="نص منخفض">x₂</button>
+    <button type="button" class="html-only" data-action="superscript" title="نص مرتفع" aria-label="نص مرتفع">x²</button>
+    <label class="html-only" title="لون النص"><input id="text-color" type="color" value="#18203a" aria-label="لون النص"></label>
+    <label class="html-only" title="لون الخلفية"><input id="background-color" type="color" value="#fff1a8" aria-label="لون الخلفية"></label>
+    <select id="alignment" title="المحاذاة" aria-label="المحاذاة"><option value="right">يمين</option><option value="center">وسط</option><option value="left">يسار</option><option value="justify">ضبط</option></select>
     <button type="button" data-action="clear" title="إزالة التنسيق" aria-label="إزالة التنسيق">Tx</button>
+    <button id="copy-markdown" class="markdown-only" type="button" title="نسخ Markdown" aria-label="نسخ Markdown">MD</button>
   </div>
   <div id="editor-shell"><div id="editor"></div></div>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>

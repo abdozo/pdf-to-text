@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 os.environ.setdefault("QSG_RHI_BACKEND", "software")
 os.environ.setdefault("WARRAQ_DISABLE_RICH_EDITOR", "1")
 
-from PySide6.QtCore import QObject, QPoint, QPointF, Qt, QUrl
+from PySide6.QtCore import QMetaObject, QObject, QPoint, QPointF, Qt, QUrl
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtTest import QTest
@@ -128,7 +128,10 @@ def test_review_has_one_side_by_side_rich_editor_and_no_matching_controls() -> N
     assert "WebEngineView" in rich_editor
     assert 'Qt.resolvedUrl("../editor/editor.html")' in rich_editor
     assert "webChannel: editorChannel" in rich_editor
-    assert "App.updatePageRichText" in rich_editor
+    assert "App.updatePageEditorContent" in rich_editor
+    assert 'objectName: "resetPageTextButton"' in review
+    assert 'id: resetPageDialog' in qml
+    assert "App.resetCurrentPageToExtraction()" in qml
     assert "Repeater { model: App.currentPage.flat_lines" not in review
     for removed in (
         "فوق الأصل", "أدوات المطابقة", "شفافية صورة الأصل",
@@ -287,6 +290,45 @@ def test_review_navigation_matches_arabic_direction(tmp_path: Path) -> None:
     assert next_button.property("text") == "‹"
 
 
+def test_reset_button_restores_only_the_open_page_after_confirmation(
+    tmp_path: Path,
+) -> None:
+    from tests_desktop.test_library import make_pdf, result
+
+    application, engine, window, bridge = _load_window(tmp_path)
+    book = bridge.library.add_book(make_pdf(tmp_path / "reset-page.pdf", 2))
+    first = result("التحويل الأصلي")
+    second = result("الصفحة الأخرى")
+    bridge.library.apply_extraction(
+        book["id"], 1, first, first.model_dump_json()
+    )
+    bridge.library.apply_extraction(
+        book["id"], 2, second, second.model_dump_json()
+    )
+    bridge.library.save_page_content(book["id"], 2, "<p>تعديل الصفحة الأخرى</p>")
+    bridge.openBook(book["id"])
+    bridge.openPage(1)
+    bridge.updatePageRichText("<p>تعديل الصفحة المفتوحة</p>")
+    application.processEvents()
+
+    reset_button = window.findChild(QObject, "resetPageTextButton")
+    reset_dialog = window.findChild(QObject, "resetPageDialog")
+    confirm_button = window.findChild(QObject, "confirmResetPageButton")
+    assert reset_button.property("enabled") is True
+
+    reset_button.clicked.emit()
+    application.processEvents()
+    assert reset_dialog.property("visible") is True
+    confirm_button.clicked.emit()
+    application.processEvents()
+
+    assert reset_dialog.property("visible") is False
+    assert bridge.currentPage["content_html"] == "<p>التحويل الأصلي</p>"
+    assert bridge.library.get_page(book["id"], 2)["content_html"] == (
+        "<p>تعديل الصفحة الأخرى</p>"
+    )
+
+
 def test_review_book_breadcrumb_and_back_button_open_current_book(tmp_path: Path) -> None:
     from tests_desktop.test_library import make_pdf
 
@@ -363,6 +405,18 @@ def test_export_dialog_prefills_the_book_name(tmp_path: Path) -> None:
     dialog.close()
 
 
+def test_export_screen_offers_word_markdown_and_interactive_html() -> None:
+    qml = resource_path("qml", "Main.qml").read_text(encoding="utf-8")
+    export = qml.split("// Export", 1)[1]
+
+    assert 'objectName:"exportFormat"' in export
+    assert '"Word (.docx)", "Markdown (.md)", "HTML تفاعلي (.html)"' in export
+    assert 'format: selectedExportFormat()' in qml
+    assert 'return exportFormat.currentIndex === 1 ? "markdown"' in qml
+    assert 'exportFormat.currentIndex === 2 ? "html"' in qml
+    assert 'defaultSuffix: exportFormat.currentIndex === 1 ? "md"' in qml
+
+
 def test_export_confirmation_counts_only_generated_pages_and_primary_text_is_white(
     tmp_path: Path,
 ) -> None:
@@ -423,6 +477,19 @@ def test_gemini_settings_use_named_keys_without_project_form() -> None:
     assert "App.createProject" not in settings
     assert "App.deleteKey(deleteKeyDialog.keyId)" in qml
     assert 'title: "حذف مفتاح Gemini"' in qml
+
+
+def test_settings_offer_system_completion_sounds() -> None:
+    qml = resource_path("qml", "Main.qml").read_text(encoding="utf-8")
+    settings = qml.split("// Settings", 1)[1].split("// Export", 1)[0]
+
+    assert 'objectName: "notificationSoundSwitch"' in settings
+    assert 'objectName: "notificationSoundBox"' in settings
+    assert 'objectName: "previewNotificationSoundButton"' in settings
+    assert "model: App.notificationSounds" in settings
+    assert "App.setNotificationSound(currentValue)" in settings
+    assert "App.previewNotificationSound()" in settings
+    assert "عند اكتمال التحويل أو فشله أو إلغائه" in settings
 
 
 def test_bridge_relinks_missing_pdf_without_losing_the_current_book(
@@ -499,6 +566,61 @@ def test_conversion_commits_the_exact_typed_page_range_before_start(tmp_path: Pa
     assert bridge.library.page_numbers_for_task(bridge.currentTask) == [25, 26]
 
 
+def test_conversion_page_inputs_respond_to_increment_and_decrement(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    start = window.findChild(QObject, "conversionFromPage")
+    end = window.findChild(QObject, "conversionToPage")
+
+    assert start.property("value") == 1
+    assert end.property("value") == 10
+    assert QMetaObject.invokeMethod(start, "increase")
+    assert QMetaObject.invokeMethod(end, "decrease")
+    application.processEvents()
+
+    assert start.property("value") == 2
+    assert end.property("value") == 9
+
+
+def test_conversion_page_buttons_keep_the_visible_numbers_in_sync(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    start = window.findChild(QObject, "conversionFromPage")
+    end = window.findChild(QObject, "conversionToPage")
+
+    # Committing an editable field must not detach its visible text from value.
+    assert QMetaObject.invokeMethod(start, "commitValue")
+    assert QMetaObject.invokeMethod(end, "commitValue")
+    assert QMetaObject.invokeMethod(start, "increase")
+    assert QMetaObject.invokeMethod(end, "decrease")
+    application.processEvents()
+
+    assert start.property("contentItem").property("text") == "2"
+    assert end.property("contentItem").property("text") == "9"
+
+
+def test_current_page_conversion_button_shows_the_open_pdf_page(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    bridge.openPage(19)
+    bridge.go("convert")
+    application.processEvents()
+
+    start = window.findChild(QObject, "conversionFromPage")
+    end = window.findChild(QObject, "conversionToPage")
+    assert QMetaObject.invokeMethod(start, "commitValue")
+    assert QMetaObject.invokeMethod(end, "commitValue")
+    current_page_button = next(
+        item
+        for item in window.findChildren(QObject)
+        if item.property("text") == "الصفحة الحالية فقط"
+    )
+    current_page_button.clicked.emit()
+    application.processEvents()
+
+    assert start.property("value") == 19
+    assert end.property("value") == 19
+    assert start.property("contentItem").property("text") == "19"
+    assert end.property("contentItem").property("text") == "19"
+
+
 def test_page_numbers_use_latin_digits_in_controls_and_review(tmp_path: Path) -> None:
     application, engine, window, bridge = _prepare_conversion_window(tmp_path)
     start = window.findChild(QObject, "conversionFromPage")
@@ -526,7 +648,21 @@ def test_rich_editor_is_tiptap_with_modern_formatting_and_local_assets() -> None
     assert "https://" not in editor
     assert resource_path("editor", "editor.bundle.js").is_file()
     assert resource_path("editor", "THIRD-PARTY-LICENSES.txt").is_file()
-    assert "waraqGetHtml" in bundle and "hasNonBreakingSpace" in bundle
+    assert "waraqGetMarkdown" in bundle and "hasNonBreakingSpace" in bundle
+
+
+def test_ai_markdown_headings_are_centered_in_the_editor() -> None:
+    editor = resource_path("editor", "editor.html").read_text(encoding="utf-8")
+    source = resource_path("editor", "editor.js").read_text(encoding="utf-8")
+    rich_editor = resource_path("qml", "RichEditor.qml").read_text(encoding="utf-8")
+
+    assert 'body[data-content-mode="markdown"] .tiptap h2' in editor
+    assert 'body[data-content-mode="markdown"] .tiptap h6' in editor
+    assert "{ text-align: center; }" in editor
+    assert '<option value="left">يسار</option>' in editor
+    assert "window.waraqSetMarkdown = (markdown, renderedHtml = '')" in source
+    assert "'ql-align-left': ['textAlign', 'left']" in source
+    assert "App.currentPage.content_html || \"\"" in rich_editor
 
 
 def test_repository_has_only_desktop_entrypoints() -> None:
@@ -550,12 +686,14 @@ def test_rich_editor_toolbar_is_arabic_rtl_and_commits_before_approval() -> None
     assert 'role="toolbar"' in editor
     for arabic_label in ("نص عادي", "عنوان رئيسي", "صغير", "كبير جدًا", "آريال", "بلكس عربي"):
         assert arabic_label in editor
-    assert "window.waraqGetHtml" in source
+    assert "window.waraqGetContent" in source
+    assert "window.waraqSetMarkdown" in source
     assert "window.waraqScrollBy" in source
     assert "function commit(approve)" in rich_editor
     assert "onWheel: function(event)" in rich_editor
     assert "pageRichTextEditor.scrollByWheel" in rich_editor
-    assert "App.commitPageRichText" in rich_editor
+    assert "App.commitPageEditorContent" in rich_editor
+    assert "App.updatePageEditorContent" in rich_editor
     assert "reviewScreen.commitPage(false)" in review
     assert "reviewScreen.commitPage(true)" in review
 
@@ -591,14 +729,17 @@ def test_rich_editor_keeps_toolbar_visible_and_reserves_bottom_reading_space() -
     assert "overflow-y: auto" in editor
 
 
-def test_rich_editor_normalizes_non_breaking_spaces_and_contains_long_text() -> None:
+def test_rich_editor_normalizes_spaces_and_wraps_without_merging_source_blocks() -> None:
     editor = resource_path("editor", "editor.html").read_text(encoding="utf-8")
     source = resource_path("editor", "editor.js").read_text(encoding="utf-8")
 
     assert "replace(/\\u00a0/g, ' ')" in source
     assert "normalizeSpaces(editor.getHTML())" in source
-    assert "overflow-wrap: anywhere" in editor
+    assert "overflow-wrap: break-word" in editor
+    assert "word-break: normal" in editor
+    assert "white-space: pre-wrap" in editor
     assert "overflow-x: hidden" in editor
+    assert "contentType: 'markdown'" in source
 
 
 def test_task_activity_is_visibly_running_in_the_center(tmp_path: Path) -> None:
@@ -667,6 +808,45 @@ def test_conversion_task_can_be_reopened_from_sidebar_after_navigating_away(
 
     assert bridge.screen == "task"
     assert bridge.currentTask["id"] == task_id
+
+
+def test_failed_task_can_return_to_its_settings_before_retrying(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    bridge._models = [
+        {"id": "gemini-3.5-flash-lite", "label": "النموذج السابق"},
+        {"id": "gemini-test-alternative", "label": "نموذج بديل"},
+    ]
+    button = window.findChild(QObject, "startConversionButton")
+    button.clicked.emit()
+    application.processEvents()
+    task_id = bridge.currentTask["id"]
+    bridge.library.update_task(task_id, state="failed", error="503 UNAVAILABLE")
+    bridge.openTask(task_id)
+    application.processEvents()
+
+    settings_button = window.findChild(QObject, "editFailedTaskSettingsButton")
+    assert settings_button.property("visible") is True
+    settings_button.clicked.emit()
+    application.processEvents()
+
+    start = window.findChild(QObject, "conversionFromPage")
+    end = window.findChild(QObject, "conversionToPage")
+    pages_per_request = window.findChild(QObject, "conversionPagesPerRequest")
+    model = window.findChild(QObject, "conversionModelBox")
+    assert bridge.screen == "convert"
+    assert bridge.currentBook["id"] == bridge.currentTask["book_id"]
+    assert start.property("value") == bridge.currentTask["start_page"]
+    assert end.property("value") == bridge.currentTask["end_page"]
+    assert pages_per_request.property("value") == bridge.currentTask["pages_per_request"]
+    assert model.property("currentText") == "النموذج السابق"
+
+    model.setProperty("currentIndex", 1)
+    button.clicked.emit()
+    application.processEvents()
+
+    assert bridge.currentTask["id"] != task_id
+    assert bridge.currentTask["model"] == "gemini-test-alternative"
+    assert bridge.currentTask["overwrite"] == 0
 
 
 def test_toast_is_anchored_to_the_physical_bottom_right() -> None:

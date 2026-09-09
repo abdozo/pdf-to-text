@@ -7,14 +7,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Property, QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from .backup import create_backup, restore_backup
 from .database import Library
-from .exporter import export_word
+from .exporter import export_html, export_markdown, export_word
 from .gemini_client import DEFAULT_MODEL, GeminiClient
+from .notifications import SYSTEM_SOUNDS, SYSTEM_SOUND_IDS, play_system_sound
 from .secrets import SecretStore
 from .tasks import ConversionRunner
 
@@ -33,7 +33,12 @@ class Bridge(QObject):
     asyncResult = Signal(object)
     pageLoaded = Signal()
 
-    def __init__(self, library: Library, secrets: SecretStore):
+    def __init__(
+        self,
+        library: Library,
+        secrets: SecretStore,
+        sound_player: Callable[[str], None] | None = None,
+    ):
         super().__init__()
         self.library = library
         self.secrets = secrets
@@ -58,6 +63,20 @@ class Bridge(QObject):
         self._toast_timer.setInterval(5_000)
         self._toast_timer.timeout.connect(self.clearToast)
         self._save_state = "محفوظ"
+        self._notification_sounds = [dict(sound) for sound in SYSTEM_SOUNDS]
+        sound_setting = self.library.setting("completion_sound", {})
+        if not isinstance(sound_setting, dict):
+            sound_setting = {}
+        selected_sound = sound_setting.get("sound_id", SYSTEM_SOUNDS[0]["id"])
+        self._notification_sound_id = (
+            selected_sound
+            if selected_sound in SYSTEM_SOUND_IDS
+            else SYSTEM_SOUNDS[0]["id"]
+        )
+        self._notification_sound_enabled = bool(sound_setting.get("enabled", True))
+        self._sound_player = (
+            sound_player if sound_player is not None else play_system_sound
+        )
         self._draft_dirty = False
         self._autosave = QTimer(self)
         self._autosave.setSingleShot(True)
@@ -83,6 +102,15 @@ class Bridge(QObject):
     exporting = Property(bool, lambda self: self._exporting, notify=stateChanged)
     toast = Property(str, lambda self: self._toast, notify=toastChanged)
     saveState = Property(str, lambda self: self._save_state, notify=stateChanged)
+    notificationSounds = Property(
+        list, lambda self: self._notification_sounds, notify=stateChanged
+    )
+    notificationSoundId = Property(
+        str, lambda self: self._notification_sound_id, notify=stateChanged
+    )
+    notificationSoundEnabled = Property(
+        bool, lambda self: self._notification_sound_enabled, notify=stateChanged
+    )
     richEditorEnabled = Property(bool, lambda self: os.environ.get("WARRAQ_DISABLE_RICH_EDITOR") != "1", constant=True)
 
     @Slot()
@@ -138,6 +166,39 @@ class Bridge(QObject):
         self._toast = message
         self.toastChanged.emit()
         self._toast_timer.start()
+
+    def _save_notification_sound_setting(self) -> None:
+        self.library.set_setting(
+            "completion_sound",
+            {
+                "enabled": self._notification_sound_enabled,
+                "sound_id": self._notification_sound_id,
+            },
+        )
+
+    @Slot(bool)
+    def setNotificationSoundEnabled(self, enabled: bool) -> None:
+        self._notification_sound_enabled = enabled
+        self._save_notification_sound_setting()
+        self.stateChanged.emit()
+
+    @Slot(str)
+    def setNotificationSound(self, sound_id: str) -> None:
+        if sound_id not in SYSTEM_SOUND_IDS:
+            return
+        self._notification_sound_id = sound_id
+        self._save_notification_sound_setting()
+        self.stateChanged.emit()
+
+    @Slot()
+    def previewNotificationSound(self) -> None:
+        self._play_notification_sound()
+
+    def _play_notification_sound(self) -> None:
+        try:
+            self._sound_player(self._notification_sound_id)
+        except Exception:
+            pass
 
     @Slot()
     def clearToast(self) -> None:
@@ -256,7 +317,30 @@ class Bridge(QObject):
     def updatePageRichText(self, content_html: str) -> None:
         if not self._page:
             return
-        if self._page.get("content_html", "") != content_html:
+        if (
+            self._page.get("content_html", "") != content_html
+            or self._page.get("content_format") != "html"
+        ):
+            self._page["content_html"] = content_html
+            self._page["content_markdown"] = ""
+            self._page["content_format"] = "html"
+            self._mark_dirty()
+
+    @Slot(str, str, str)
+    def updatePageEditorContent(
+        self, content_format: str, content_markdown: str, content_html: str
+    ) -> None:
+        if not self._page:
+            return
+        next_format = "markdown" if content_format == "markdown" else "html"
+        next_markdown = content_markdown if next_format == "markdown" else ""
+        if (
+            self._page.get("content_format", "html") != next_format
+            or self._page.get("content_markdown", "") != next_markdown
+            or self._page.get("content_html", "") != content_html
+        ):
+            self._page["content_format"] = next_format
+            self._page["content_markdown"] = next_markdown
             self._page["content_html"] = content_html
             self._mark_dirty()
 
@@ -291,6 +375,50 @@ class Bridge(QObject):
             self.stateChanged.emit()
             self._notify(str(exc))
 
+    @Slot(str, int, str, str, str, bool)
+    def commitPageEditorContent(
+        self,
+        book_id: str,
+        page_number: int,
+        content_format: str,
+        content_markdown: str,
+        content_html: str,
+        approve: bool,
+    ) -> None:
+        """Persist Markdown pages while retaining the legacy HTML editor path."""
+        try:
+            markdown = content_markdown if content_format == "markdown" else None
+            saved = self.library.save_page_content(
+                book_id,
+                page_number,
+                content_html,
+                reviewed=True if approve else None,
+                reason="review" if approve else "manual_edit",
+                content_markdown=markdown,
+            )
+            if (
+                self._book.get("id") == book_id
+                and self._page.get("number") == page_number
+            ):
+                saved["image_url"] = f"image://pages/{book_id}/{page_number}?dpi=180"
+                saved["flat_lines"] = self._flatten_lines(saved)
+                self._page = saved
+                self._draft_dirty = False
+                self._autosave.stop()
+                self._save_state = "محفوظ"
+            self.refresh()
+            if approve:
+                self._notify("اعتُمدت الصفحة")
+        except Exception as exc:
+            self._save_state = "تعذر الحفظ"
+            self.stateChanged.emit()
+            self._notify(str(exc))
+
+    @Slot(str)
+    def copyMarkdown(self, content_markdown: str) -> None:
+        QGuiApplication.clipboard().setText(content_markdown)
+        self._notify("نُسخ Markdown")
+
     def _mark_dirty(self) -> None:
         self._draft_dirty = True
         self._save_state = "جارٍ الحفظ"
@@ -301,6 +429,33 @@ class Bridge(QObject):
     def savePage(self) -> None:
         self._save_draft()
 
+    @Slot()
+    def resetCurrentPageToExtraction(self) -> None:
+        if not self._page or not self._book:
+            return
+        was_dirty = self._draft_dirty
+        self._autosave.stop()
+        self._draft_dirty = False
+        try:
+            self._page = self.library.reset_page_to_extraction(
+                self._book["id"], self._page["number"]
+            )
+            self._page["image_url"] = (
+                f"image://pages/{self._book['id']}/{self._page['number']}?dpi=180"
+            )
+            self._page["flat_lines"] = self._flatten_lines(self._page)
+            self._save_state = "محفوظ"
+            self.refresh()
+            self.pageLoaded.emit()
+            self._notify("أُعيد نص الصفحة إلى التحويل الأصلي")
+        except Exception as exc:
+            self._draft_dirty = was_dirty
+            if was_dirty:
+                self._autosave.start()
+            self._save_state = "جارٍ الحفظ" if was_dirty else "تعذر الحفظ"
+            self.stateChanged.emit()
+            self._notify(str(exc))
+
     def _save_draft(self) -> None:
         if not self._draft_dirty or not self._page or not self._book:
             return
@@ -308,6 +463,11 @@ class Bridge(QObject):
             self._page = self.library.save_page_content(
                 self._book["id"], self._page["number"], self._page.get("content_html", ""),
                 reason="manual_edit",
+                content_markdown=(
+                    self._page.get("content_markdown", "")
+                    if self._page.get("content_format") == "markdown"
+                    else None
+                ),
             )
             self._page["image_url"] = f"image://pages/{self._book['id']}/{self._page['number']}?dpi=180"
             self._page["flat_lines"] = self._flatten_lines(self._page)
@@ -324,6 +484,11 @@ class Bridge(QObject):
             self._page = self.library.save_page_content(
                 self._book["id"], self._page["number"], self._page.get("content_html", ""),
                 reviewed=True, reason="review",
+                content_markdown=(
+                    self._page.get("content_markdown", "")
+                    if self._page.get("content_format") == "markdown"
+                    else None
+                ),
             )
             self._page["image_url"] = f"image://pages/{self._book['id']}/{self._page['number']}?dpi=180"
             self._page["flat_lines"] = self._flatten_lines(self._page)
@@ -479,9 +644,21 @@ class Bridge(QObject):
             try: self._task = self.library.task(self._task["id"])
             except KeyError: pass
         self.refresh()
-        if data.get("state") == "failed": self._notify(data.get("error", "فشل التحويل"))
-        elif data.get("type") == "task" and data.get("state") == "completed": self._notify("اكتملت مهمة التحويل")
-        elif data.get("type") == "task" and data.get("state") == "completed_with_errors": self._notify("اكتملت المهمة مع صفحات تحتاج إعادة المحاولة")
+        state = data.get("state")
+        if data.get("type") == "task" and state in {
+            "completed", "completed_with_errors", "failed", "cancelled",
+        }:
+            messages = {
+                "completed": "اكتملت مهمة التحويل",
+                "completed_with_errors": "اكتملت المهمة مع صفحات تحتاج إعادة المحاولة",
+                "failed": data.get("error", "فشل التحويل"),
+                "cancelled": "أُلغيت مهمة التحويل وبقيت الصفحات المحفوظة",
+            }
+            self._notify(messages[state])
+            if self._notification_sound_enabled:
+                self._play_notification_sound()
+        elif state == "failed":
+            self._notify(data.get("error", "فشل التحويل"))
 
     @Slot(object)
     def _apply_async(self, result: object) -> None:
@@ -523,16 +700,29 @@ class Bridge(QObject):
             destination = local_path(config["destination"])
             if not str(destination):
                 raise ValueError("اختر مكان حفظ الملف")
+            export_format = str(config.get("format") or "word").lower()
+            export_options = {
+                "word": (export_word, ".docx", "Word"),
+                "markdown": (export_markdown, ".md", "Markdown"),
+                "html": (export_html, ".html", "HTML"),
+            }
+            if export_format not in export_options:
+                raise ValueError("صيغة التصدير غير مدعومة")
+            exporter, suffix, format_label = export_options[export_format]
+            if destination.suffix.lower() != suffix:
+                destination = destination.with_suffix(suffix)
             book_id = config.get("book_id") or self._book["id"]
             start_page = int(config["start_page"])
             end_page = int(config["end_page"])
             self._exporting = True
             self.stateChanged.emit()
-            self._notify("بدأ إنشاء ملف Word. يمكنك متابعة العمل وسيظهر إشعار عند اكتماله.")
+            self._notify(
+                f"بدأ إنشاء ملف {format_label}. يمكنك متابعة العمل وسيظهر إشعار عند اكتماله."
+            )
 
             def work() -> None:
                 try:
-                    report = export_word(
+                    report = exporter(
                         self.library,
                         book_id,
                         start_page,

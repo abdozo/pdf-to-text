@@ -23,6 +23,10 @@ class ConversionRunner:
         self.secrets = secrets
         self.progress = progress or (lambda _event: None)
         self._thread: threading.Thread | None = None
+        self._active_task_id: str | None = None
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._clients: dict[str, Any] = {}
+        self._request_ids: dict[str, str] = {}
         self._lock = threading.Lock()
 
     @property
@@ -34,14 +38,45 @@ class ConversionRunner:
             if self.running:
                 raise RuntimeError("توجد مهمة تحويل جارية")
             self.library.prepare_task_run(task_id)
-            self._thread = threading.Thread(target=self._run, args=(task_id,), name=f"waraq-{task_id[:8]}", daemon=True)
+            cancel_event = threading.Event()
+            self._cancel_events[task_id] = cancel_event
+            self._active_task_id = task_id
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(task_id, cancel_event),
+                name=f"waraq-{task_id[:8]}",
+                daemon=True,
+            )
             self._thread.start()
 
     def request_pause(self, task_id: str) -> None:
         self.library.request_task_action(task_id, "pause")
 
     def request_cancel(self, task_id: str) -> None:
+        with self._lock:
+            cancel_event = self._cancel_events.get(task_id)
+            if cancel_event is not None:
+                cancel_event.set()
+            client = self._clients.pop(task_id, None)
+            request_id = self._request_ids.get(task_id)
+            if self._active_task_id == task_id:
+                self._active_task_id = None
+                self._thread = None
         self.library.request_task_action(task_id, "cancel")
+        if request_id:
+            self.library.finish_request(
+                request_id,
+                "cancelled",
+                error="ألغى المستخدم مهمة التحويل",
+            )
+        if client is not None:
+            threading.Thread(
+                target=self._close_client,
+                args=(client,),
+                name=f"waraq-cancel-{task_id[:8]}",
+                daemon=True,
+            ).start()
+        self.progress({"type": "task", "state": "cancelled", "task_id": task_id})
 
     def request_stop(self, task_id: str) -> None:
         self.request_pause(task_id)
@@ -50,20 +85,32 @@ class ConversionRunner:
         if self._thread:
             self._thread.join(timeout)
 
-    def _run(self, task_id: str) -> None:
+    def _run(self, task_id: str, cancel_event: threading.Event) -> None:
+        client: Any = None
         task = self.library.task(task_id)
         try:
             key_meta = self.library.key_metadata(task["key_id"])
             client = GeminiClient(self.secrets.get(key_meta["secret_ref"]))
+            with self._lock:
+                cancelled_before_client_ready = cancel_event.is_set()
+                if not cancelled_before_client_ready:
+                    self._clients[task_id] = client
+            if cancelled_before_client_ready:
+                self._close_client(client)
+                return
             pages = self.library.page_numbers_for_task(task)
             batch_size = max(1, int(task.get("pages_per_request", 1)))
             batches = [pages[index:index + batch_size] for index in range(0, len(pages), batch_size)]
             for numbers in batches:
+                if cancel_event.is_set():
+                    return
                 if self._apply_requested_action(task_id):
                     return
                 while True:
                     try:
                         request_id = self.library.start_request(task, numbers)
+                        with self._lock:
+                            self._request_ids[task_id] = request_id
                         break
                     except RequestThrottleDelay as delay:
                         self.progress({
@@ -73,6 +120,8 @@ class ConversionRunner:
                         })
                         if self._wait_for_throttle(task_id, delay.wait_seconds):
                             return
+                if cancel_event.is_set():
+                    return
                 self.library.start_task_pages(task_id, numbers)
                 self.progress({
                     "type": "page", "state": "sending", "page": numbers[0],
@@ -101,11 +150,18 @@ class ConversionRunner:
                         result_pages = batch.pages
                         raw = batch.raw
                         usage = batch.usage
+                    if cancel_event.is_set():
+                        return
                     self.library.finish_request(
                         request_id, "success", usage=usage, response=raw
                     )
+                    with self._lock:
+                        if self._request_ids.get(task_id) == request_id:
+                            self._request_ids.pop(task_id, None)
                     request_finished = True
                     for number in numbers:
+                        if cancel_event.is_set():
+                            return
                         page = result_pages[number]
                         self.library.apply_extraction(
                             task["book_id"], number, page, page.model_dump_json()
@@ -117,7 +173,12 @@ class ConversionRunner:
                             "pages": numbers, "task_id": task_id, "usage": usage,
                         })
                 except GeminiFailure as exc:
+                    if cancel_event.is_set():
+                        return
                     self.library.finish_request(request_id, "error", usage=exc.usage, error=str(exc), http_status=exc.status)
+                    with self._lock:
+                        if self._request_ids.get(task_id) == request_id:
+                            self._request_ids.pop(task_id, None)
                     self._fail_batch(task, task_id, numbers, completed_pages, str(exc))
                     if self._apply_requested_action(task_id):
                         return
@@ -126,10 +187,17 @@ class ConversionRunner:
                         self.progress({"type": "task", "state": "failed", "task_id": task_id, "error": str(exc)})
                         return
                 except Exception as exc:
+                    if cancel_event.is_set():
+                        return
                     message = str(exc)
                     if not request_finished:
                         self.library.finish_request(request_id, "error", error=message)
+                        with self._lock:
+                            if self._request_ids.get(task_id) == request_id:
+                                self._request_ids.pop(task_id, None)
                     self._fail_batch(task, task_id, numbers, completed_pages, message)
+            if cancel_event.is_set():
+                return
             if self._apply_requested_action(task_id):
                 return
             final = self.library.task(task_id)
@@ -137,8 +205,30 @@ class ConversionRunner:
             self.library.update_task(task_id, state=state, control_action="", current_page=None)
             self.progress({"type": "task", "state": state, "task_id": task_id})
         except Exception as exc:
+            if cancel_event.is_set():
+                return
             self.library.update_task(task_id, state="failed", control_action="", current_page=None, error=str(exc))
             self.progress({"type": "task", "state": "failed", "task_id": task_id, "error": str(exc)})
+        finally:
+            current_thread = threading.current_thread()
+            with self._lock:
+                client_to_close = self._clients.pop(task_id, None)
+                self._request_ids.pop(task_id, None)
+                self._cancel_events.pop(task_id, None)
+                if self._thread is current_thread:
+                    self._thread = None
+                    self._active_task_id = None
+            self._close_client(client_to_close)
+
+    @staticmethod
+    def _close_client(client: Any) -> None:
+        close = getattr(client, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            pass
 
     def _fail_batch(
         self,
@@ -170,6 +260,8 @@ class ConversionRunner:
 
     def _apply_requested_action(self, task_id: str) -> bool:
         task = self.library.task(task_id)
+        if task.get("state") == "cancelled":
+            return True
         action = task.get("control_action")
         if action not in {"pause", "cancel"}:
             return False

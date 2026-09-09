@@ -8,7 +8,7 @@ from typing import Any
 
 _HEADING_TAGS = {f"h{level}" for level in range(1, 7)}
 _BLOCK_TAGS = {"p", "div", "blockquote", "li"} | _HEADING_TAGS
-_ALLOWED_TAGS = _BLOCK_TAGS | {"br", "strong", "b", "em", "i", "u", "s", "sup", "sub", "span", "ol", "ul"}
+_ALLOWED_TAGS = _BLOCK_TAGS | {"br", "hr", "strong", "b", "em", "i", "u", "s", "sup", "sub", "span", "ol", "ul"}
 _ALLOWED_STYLES = {
     "background-color", "color", "direction", "font-family", "font-size",
     "font-style", "font-weight", "margin-left", "margin-right",
@@ -16,7 +16,7 @@ _ALLOWED_STYLES = {
 }
 _ALLOWED_CLASS = re.compile(
     r"^(?:ql-(?:font-(?:naskh|arial|plex)|size-(?:small|large|huge)|"
-    r"align-(?:center|right|justify)|direction-rtl|indent-[1-8]))$"
+    r"align-(?:center|right|left|justify)|direction-rtl|indent-[1-8]))$"
 )
 
 
@@ -49,6 +49,9 @@ class _Sanitizer(HTMLParser):
             return
         if self._skip or tag not in _ALLOWED_TAGS:
             return
+        if tag in {"br", "hr"}:
+            self.output.append(f"<{tag}>")
+            return
         rendered: list[str] = []
         if tag in _BLOCK_TAGS | {"span"}:
             style = next((value for key, value in attrs if key.lower() == "style" and value), "")
@@ -67,15 +70,16 @@ class _Sanitizer(HTMLParser):
         self.output.append(f"<{tag}{rendered_attrs}>")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if not self._skip and tag.lower() == "br":
-            self.output.append("<br>")
+        tag = tag.lower()
+        if not self._skip and tag in {"br", "hr"}:
+            self.output.append(f"<{tag}>")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag in {"head", "script", "style"}:
             self._skip = max(0, self._skip - 1)
             return
-        if not self._skip and tag in _ALLOWED_TAGS and tag != "br":
+        if not self._skip and tag in _ALLOWED_TAGS and tag not in {"br", "hr"}:
             self.output.append(f"</{tag}>")
 
     def handle_data(self, data: str) -> None:
@@ -120,7 +124,7 @@ def extracted_lines_to_html(lines: list[str]) -> str:
             list_items.append(safe)
             continue
         flush_list()
-        if not re.match(r"^<(?:p|div|blockquote|h[1-6]|ol|ul)(?:\s|>)", safe):
+        if not re.match(r"^<(?:p|div|blockquote|h[1-6]|ol|ul)(?:\s|>)|^<hr>$", safe):
             safe = f"<p>{safe}</p>"
         output.append(safe)
     flush_list()
@@ -160,7 +164,7 @@ class _PlainBlocks(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() in _BLOCK_TAGS and self.current:
             self._flush()
-        elif tag.lower() == "br":
+        elif tag.lower() in {"br", "hr"}:
             self._flush()
 
     def handle_endtag(self, tag: str) -> None:
@@ -192,6 +196,7 @@ class _RichBlocks(HTMLParser):
             self.blocks.append({
                 "quote": bool(self.states[-1].get("quote")),
                 "heading_level": self.states[-1].get("heading_level"),
+                "align": self.states[-1].get("align"),
                 "runs": self.runs,
             })
         self.runs = []
@@ -200,6 +205,10 @@ class _RichBlocks(HTMLParser):
         tag = tag.lower()
         if tag == "br":
             self._flush()
+            return
+        if tag == "hr":
+            self._flush()
+            self.blocks.append({"separator": True, "runs": []})
             return
         if tag in _BLOCK_TAGS and self.runs:
             self._flush()
@@ -236,6 +245,8 @@ class _RichBlocks(HTMLParser):
                 state["italic"] = True
             elif key == "text-decoration" and "underline" in raw:
                 state["underline"] = True
+            elif key == "text-align":
+                state["align"] = raw.lower()
         classes = next((value for key, value in attrs if key.lower() == "class" and value), "")
         for name in classes.split():
             if name.startswith("ql-font-"):
@@ -256,7 +267,7 @@ class _RichBlocks(HTMLParser):
         tag = tag.lower()
         if tag in _BLOCK_TAGS:
             self._flush()
-        if tag != "br" and len(self.states) > 1:
+        if tag not in {"br", "hr"} and len(self.states) > 1:
             self.states.pop()
 
     def handle_data(self, data: str) -> None:

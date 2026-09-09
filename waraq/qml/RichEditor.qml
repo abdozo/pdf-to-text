@@ -14,8 +14,16 @@ Item {
             else App.savePage()
             return
         }
-        pageRichTextEditor.runJavaScript("window.waraqGetHtml()", function(html) {
-            App.commitPageRichText(bookId, pageNumber, html || "", approve)
+        pageRichTextEditor.runJavaScript("window.waraqGetContent()", function(serialized) {
+            const content = JSON.parse(serialized || "{}")
+            App.commitPageEditorContent(
+                bookId,
+                pageNumber,
+                content.format || "html",
+                content.markdown || "",
+                content.html || "",
+                approve
+            )
         })
     }
 
@@ -33,8 +41,12 @@ Item {
             pageRichTextEditor.loadPage()
         }
 
-        function contentChanged(html) {
-            App.updatePageRichText(html)
+        function contentChanged(format, markdown, html) {
+            App.updatePageEditorContent(format, markdown, html)
+        }
+
+        function copyMarkdown(markdown) {
+            App.copyMarkdown(markdown)
         }
     }
 
@@ -51,7 +63,17 @@ Item {
 
         function loadPage() {
             if (!editorReady) return
-            runJavaScript("window.waraqSetHtml(" + JSON.stringify(App.currentPage.content_html || "") + ")")
+            if (App.currentPage.content_format === "markdown") {
+                runJavaScript(
+                    "window.waraqSetMarkdown("
+                    + JSON.stringify(App.currentPage.content_markdown || "")
+                    + ","
+                    + JSON.stringify(App.currentPage.content_html || "")
+                    + ")"
+                )
+            } else {
+                runJavaScript("window.waraqSetHtml(" + JSON.stringify(App.currentPage.content_html || "") + ")")
+            }
         }
 
         function scrollByWheel(pixelDeltaY, angleDeltaY) {

@@ -11,6 +11,12 @@ from zoneinfo import ZoneInfo
 
 import pypdfium2 as pdfium
 
+from .markdown_text import (
+    markdown_lines_to_document,
+    markdown_to_html,
+    normalize_markdown_document,
+    typed_lines_to_html,
+)
 from .models import DEFAULT_MANUSCRIPT_PROMPT, DEFAULT_PRINTED_PROMPT, ExtractedPage, normalize_visual_line_text
 from .richtext import extracted_lines_to_html, regions_to_html, rich_html_lines, sanitize_rich_html
 
@@ -202,6 +208,15 @@ MIGRATIONS: tuple[str, ...] = (
     DROP TABLE projects;
     DROP INDEX requests_project_model_time;
     CREATE INDEX requests_key_model_time ON requests(key_id, model, started_at);
+    """,
+    """
+    ALTER TABLE pages ADD COLUMN original_content_html TEXT NOT NULL DEFAULT '';
+    """,
+    """
+    ALTER TABLE pages ADD COLUMN content_markdown TEXT NOT NULL DEFAULT '';
+    ALTER TABLE pages ADD COLUMN original_content_markdown TEXT NOT NULL DEFAULT '';
+    ALTER TABLE pages ADD COLUMN content_format TEXT NOT NULL DEFAULT 'html';
+    ALTER TABLE pages ADD COLUMN original_content_format TEXT NOT NULL DEFAULT 'html';
     """,
 )
 
@@ -434,6 +449,14 @@ class Library:
                 page["regions"].append(region)
             if not page.get("content_html") and page["regions"]:
                 page["content_html"] = regions_to_html(page["regions"])
+            page["can_reset_to_extraction"] = bool(
+                page["state"] == "done"
+                and (
+                    page.get("original_content_markdown")
+                    or page.get("original_content_html")
+                    or page.get("raw_result")
+                )
+            )
             db.execute("UPDATE books SET last_page=?, updated_at=? WHERE id=?", (number, utc_now(), book_id))
             return page
 
@@ -462,7 +485,7 @@ class Library:
             self._insert_regions(db, page["id"], normalized)
             next_reviewed = int(reviewed) if reviewed is not None else (0 if changed else page["reviewed"])
             db.execute(
-                "UPDATE pages SET state='done', reviewed=?, error='', content_html=?, updated_at=? WHERE id=?",
+                "UPDATE pages SET state='done', reviewed=?, error='', content_html=?, content_markdown='', content_format='html', updated_at=? WHERE id=?",
                 (next_reviewed, regions_to_html(normalized), now, page["id"]),
             )
             db.execute("UPDATE books SET updated_at=?, last_page=? WHERE id=?", (now, page_number, book_id))
@@ -475,10 +498,26 @@ class Library:
         content_html: str,
         reviewed: bool | None = None,
         reason: str = "edit",
+        content_markdown: str | None = None,
     ) -> dict[str, Any]:
-        """Save the page-wide rich editor and keep a plain-line compatibility view."""
+        """Save canonical Markdown or legacy HTML and a plain-line compatibility view."""
         now = utc_now()
-        safe_html = sanitize_rich_html(content_html)
+        safe_markdown = (
+            normalize_markdown_document(content_markdown)
+            if content_markdown is not None
+            else ""
+        )
+        if content_markdown is not None:
+            rendered_markdown = markdown_to_html(safe_markdown)
+            editor_html = sanitize_rich_html(content_html)
+            safe_html = (
+                editor_html
+                if editor_html
+                and rich_html_lines(editor_html) == rich_html_lines(rendered_markdown)
+                else rendered_markdown
+            )
+        else:
+            safe_html = sanitize_rich_html(content_html)
         plain_lines = rich_html_lines(safe_html)
         with self.transaction() as db:
             page = db.execute(
@@ -488,7 +527,11 @@ class Library:
                 raise KeyError("الصفحة غير موجودة")
             old = self._snapshot(db, page["id"])
             old_html = page["content_html"] or regions_to_html(old["regions"])
-            changed = sanitize_rich_html(old_html) != safe_html
+            changed = (
+                page["content_markdown"] != safe_markdown
+                if content_markdown is not None and page["content_markdown"]
+                else sanitize_rich_html(old_html) != safe_html
+            )
             if changed and (old["regions"] or old_html):
                 db.execute(
                     "INSERT INTO page_versions VALUES (?, ?, ?, ?, ?)",
@@ -499,15 +542,125 @@ class Library:
                 self._insert_regions(db, page["id"], self._compatibility_regions(plain_lines))
             next_reviewed = int(reviewed) if reviewed is not None else (0 if changed else page["reviewed"])
             db.execute(
-                "UPDATE pages SET state='done', reviewed=?, error='', content_html=?, updated_at=? WHERE id=?",
-                (next_reviewed, safe_html, now, page["id"]),
+                "UPDATE pages SET state='done', reviewed=?, error='', content_html=?, content_markdown=?, content_format=?, updated_at=? WHERE id=?",
+                (
+                    next_reviewed,
+                    safe_html,
+                    safe_markdown,
+                    "markdown" if content_markdown is not None else "html",
+                    now,
+                    page["id"],
+                ),
             )
             db.execute("UPDATE books SET updated_at=?, last_page=? WHERE id=?", (now, page_number, book_id))
         return self.get_page(book_id, page_number)
 
+    def reset_page_to_extraction(
+        self, book_id: str, page_number: int
+    ) -> dict[str, Any]:
+        """Restore the last AI extraction without changing its saved baseline."""
+        now = utc_now()
+        with self.transaction() as db:
+            page = db.execute(
+                "SELECT * FROM pages WHERE book_id=? AND number=?",
+                (book_id, page_number),
+            ).fetchone()
+            if page is None:
+                raise KeyError("الصفحة غير موجودة")
+            if page["state"] != "done" or not (
+                page["original_content_markdown"]
+                or page["original_content_html"]
+                or page["raw_result"]
+            ):
+                raise ValueError("لا يوجد نص محوّل لإعادته في هذه الصفحة")
+
+            original_format = page["original_content_format"]
+            original_markdown = page["original_content_markdown"]
+            original_html = page["original_content_html"]
+            if original_format == "markdown" and original_markdown and not original_html:
+                original_html = markdown_to_html(original_markdown)
+            elif not original_html:
+                try:
+                    raw_result = json.loads(page["raw_result"])
+                    if "lines" in raw_result:
+                        extracted = ExtractedPage.model_validate(raw_result)
+                        original_format = "markdown"
+                        original_markdown = markdown_lines_to_document(
+                            extracted.content_markdown
+                        )
+                        original_html = markdown_to_html(original_markdown)
+                    elif "content_markdown" in raw_result:
+                        original_format = "markdown"
+                        original_markdown = markdown_lines_to_document(
+                            raw_result["content_markdown"]
+                        )
+                        original_html = markdown_to_html(original_markdown)
+                    elif "content_html" in raw_result:
+                        original_html = extracted_lines_to_html(raw_result["content_html"])
+                    else:
+                        raise ValueError
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    raise ValueError(
+                        "تعذر العثور على نسخة التحويل الأصلية لهذه الصفحة"
+                    ) from None
+            original_html = sanitize_rich_html(original_html)
+
+            old = self._snapshot(db, page["id"])
+            old_html = sanitize_rich_html(
+                page["content_html"] or regions_to_html(old["regions"])
+            )
+            reset_changes_content = (
+                old_html != original_html
+                or page["content_format"] != original_format
+                or (
+                    original_format == "markdown"
+                    and page["content_markdown"] != original_markdown
+                )
+            )
+            if reset_changes_content:
+                db.execute(
+                    "INSERT INTO page_versions VALUES (?, ?, ?, ?, ?)",
+                    (
+                        uuid.uuid4().hex,
+                        page["id"],
+                        "reset_to_extraction",
+                        json.dumps(old, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                db.execute("DELETE FROM regions WHERE page_id=?", (page["id"],))
+                self._insert_regions(
+                    db,
+                    page["id"],
+                    self._compatibility_regions(rich_html_lines(original_html)),
+                )
+            db.execute(
+                """UPDATE pages
+                   SET state='done', reviewed=0, error='', content_html=?,
+                       original_content_html=?, content_markdown=?,
+                       original_content_markdown=?, content_format=?,
+                       original_content_format=?, updated_at=? WHERE id=?""",
+                (
+                    original_html,
+                    original_html,
+                    original_markdown,
+                    original_markdown,
+                    original_format,
+                    original_format,
+                    now,
+                    page["id"],
+                ),
+            )
+            db.execute(
+                "UPDATE books SET updated_at=?, last_page=? WHERE id=?",
+                (now, page_number, book_id),
+            )
+        return self.get_page(book_id, page_number)
+
     def apply_extraction(self, book_id: str, page_number: int, result: ExtractedPage, raw: str, reason: str = "extraction") -> None:
         now = utc_now()
-        content_html = extracted_lines_to_html(result.content_html)
+        content_markdown = markdown_lines_to_document(result.content_markdown)
+        content_html = typed_lines_to_html(result.lines)
         regions = self._compatibility_regions(rich_html_lines(content_html))
         with self.transaction() as db:
             page = db.execute("SELECT * FROM pages WHERE book_id=? AND number=?", (book_id, page_number)).fetchone()
@@ -521,8 +674,22 @@ class Library:
             db.execute(
                 """UPDATE pages
                    SET state='done', reviewed=0, printed_page=?, is_blank=?, error='',
-                       raw_result=?, content_html=?, updated_at=? WHERE id=?""",
-                (result.printed_page, int(result.is_blank), raw, content_html, now, page["id"]),
+                       raw_result=?, content_html=?, original_content_html=?,
+                       content_markdown=?, original_content_markdown=?,
+                       content_format='markdown', original_content_format='markdown',
+                       updated_at=?
+                   WHERE id=?""",
+                (
+                    result.printed_page or "",
+                    int(result.is_blank),
+                    raw,
+                    content_html,
+                    content_html,
+                    content_markdown,
+                    content_markdown,
+                    now,
+                    page["id"],
+                ),
             )
 
     def mark_page_failed(self, book_id: str, page_number: int, error: str) -> None:
@@ -816,7 +983,12 @@ class Library:
             if state in {"completed", "cancelled"}:
                 raise RuntimeError("انتهت مهمة التحويل بالفعل")
             now = utc_now()
-            if action == "cancel" and state not in {"queued", "running"}:
+            if action == "cancel":
+                db.execute(
+                    """UPDATE task_pages SET state='pending',error='',updated_at=?
+                       WHERE task_id=? AND state='running'""",
+                    (now, task_id),
+                )
                 db.execute(
                     """UPDATE tasks SET state='cancelled',control_action='',stop_requested=0,
                        current_page=NULL,updated_at=? WHERE id=?""",

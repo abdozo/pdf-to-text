@@ -4,6 +4,7 @@ import Subscript from '@tiptap/extension-subscript'
 import Superscript from '@tiptap/extension-superscript'
 import TextAlign from '@tiptap/extension-text-align'
 import { TextStyleKit } from '@tiptap/extension-text-style'
+import { Markdown } from '@tiptap/markdown'
 import { EditorState } from '@tiptap/pm/state'
 
 const normalizeSpaces = value => String(value || '').replace(/\u00a0/g, ' ')
@@ -14,6 +15,7 @@ const normalizeLegacyHtml = value => {
   const classStyles = {
     'ql-align-center': ['textAlign', 'center'],
     'ql-align-right': ['textAlign', 'right'],
+    'ql-align-left': ['textAlign', 'left'],
     'ql-align-justify': ['textAlign', 'justify'],
     'ql-direction-rtl': ['direction', 'rtl'],
     'ql-font-naskh': ['fontFamily', 'Noto Naskh Arabic'],
@@ -37,6 +39,7 @@ const normalizeLegacyHtml = value => {
 
 let host = null
 let timer = null
+let contentMode = 'html'
 
 const editor = new Editor({
   element: document.querySelector('#editor'),
@@ -45,9 +48,10 @@ const editor = new Editor({
     Subscript,
     Superscript,
     TextStyleKit,
+    Markdown,
     TextAlign.configure({
       types: ['heading', 'paragraph'],
-      alignments: ['right', 'center', 'justify'],
+      alignments: ['right', 'center', 'left', 'justify'],
       defaultAlignment: 'right'
     })
   ],
@@ -63,7 +67,11 @@ const editor = new Editor({
   onUpdate: ({ editor: currentEditor }) => {
     if (!host) return
     clearTimeout(timer)
-    timer = setTimeout(() => host.contentChanged(normalizeSpaces(currentEditor.getHTML())), 300)
+    timer = setTimeout(() => host.contentChanged(
+      contentMode,
+      contentMode === 'markdown' ? normalizeSpaces(currentEditor.getMarkdown()) : '',
+      normalizeSpaces(currentEditor.getHTML())
+    ), 300)
     updateToolbar()
   },
   onSelectionUpdate: updateToolbar
@@ -116,6 +124,9 @@ document.querySelector('#text-color').addEventListener('input', event => {
 document.querySelector('#background-color').addEventListener('input', event => {
   run(chain => chain.setBackgroundColor(event.target.value))
 })
+document.querySelector('#copy-markdown').addEventListener('click', () => {
+  if (host) host.copyMarkdown(normalizeSpaces(editor.getMarkdown()))
+})
 
 function updateToolbar() {
   if (!editor) return
@@ -124,11 +135,11 @@ function updateToolbar() {
     const button = document.querySelector(`[data-action="${action}"]`)
     if (button) button.classList.toggle('active', editor.isActive(action))
   })
-  heading.value = [1, 2, 3, 4, 5, 6].find(level => editor.isActive('heading', { level })) || '0'
+  heading.value = [2, 3, 4, 5, 6].find(level => editor.isActive('heading', { level })) || '0'
   const attributes = editor.getAttributes('textStyle')
   fontFamily.value = attributes.fontFamily || ''
   fontSize.value = attributes.fontSize || ''
-  alignment.value = ['center', 'justify'].find(value => editor.isActive({ textAlign: value })) || 'right'
+  alignment.value = ['center', 'left', 'justify'].find(value => editor.isActive({ textAlign: value })) || 'right'
 }
 
 const publishLayoutMetrics = () => {
@@ -156,18 +167,50 @@ const resetEditorState = () => {
   }))
 }
 
+const setContentMode = mode => {
+  contentMode = mode === 'markdown' ? 'markdown' : 'html'
+  document.body.dataset.contentMode = contentMode
+}
+
 window.waraqSetHtml = html => {
+  clearTimeout(timer)
+  timer = null
+  setContentMode('html')
   editor.commands.setContent(normalizeLegacyHtml(html), { emitUpdate: false })
   resetEditorState()
   updateToolbar()
   requestAnimationFrame(() => requestAnimationFrame(publishLayoutMetrics))
 }
+window.waraqSetMarkdown = (markdown, renderedHtml = '') => {
+  clearTimeout(timer)
+  timer = null
+  setContentMode('markdown')
+  if (renderedHtml) {
+    editor.commands.setContent(normalizeLegacyHtml(renderedHtml), { emitUpdate: false })
+  } else {
+    editor.commands.setContent(normalizeSpaces(markdown), {
+      contentType: 'markdown',
+      emitUpdate: false
+    })
+  }
+  resetEditorState()
+  updateToolbar()
+  requestAnimationFrame(() => requestAnimationFrame(publishLayoutMetrics))
+}
 window.waraqGetHtml = () => normalizeSpaces(editor.getHTML())
+window.waraqGetMarkdown = () => normalizeSpaces(editor.getMarkdown())
+window.waraqGetContent = () => JSON.stringify({
+  format: contentMode,
+  markdown: contentMode === 'markdown' ? normalizeSpaces(editor.getMarkdown()) : '',
+  html: normalizeSpaces(editor.getHTML())
+})
 window.waraqScrollBy = deltaY => {
   const root = document.querySelector('.tiptap')
   root.scrollTop += Number(deltaY) || 0
   return { top: root.scrollTop, maximum: root.scrollHeight - root.clientHeight }
 }
+
+setContentMode('html')
 
 new QWebChannel(qt.webChannelTransport, channel => {
   host = channel.objects.editorHost
