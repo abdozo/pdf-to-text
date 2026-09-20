@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any
@@ -81,11 +82,31 @@ def _set_paragraph_rtl(paragraph: Any) -> None:
     ppr.find(qn("w:jc")).set(qn("w:val"), "start")
 
 
-def _set_paragraph_alignment(paragraph: Any, alignment: str) -> None:
+def _uses_rtl(text: str) -> bool:
+    for character in text:
+        direction = unicodedata.bidirectional(character)
+        if direction in {"R", "AL"}:
+            return True
+        if direction == "L":
+            return False
+    return True
+
+
+def _set_paragraph_ltr(paragraph: Any) -> None:
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    ppr = paragraph._p.get_or_add_pPr()
+    bidi = ppr.find(qn("w:bidi"))
+    if bidi is None:
+        bidi = OxmlElement("w:bidi")
+        ppr.insert_element_before(bidi, "w:jc")
+    bidi.set(qn("w:val"), "0")
+
+
+def _set_paragraph_alignment(paragraph: Any, alignment: str, *, rtl: bool = True) -> None:
     """Use logical alignment so RTL stays portable across Word renderers."""
     value = {
-        "right": "start",
-        "left": "end",
+        "right": "start" if rtl else "end",
+        "left": "end" if rtl else "start",
         "center": "center",
         "justify": "both",
     }.get(alignment)
@@ -138,11 +159,12 @@ def _set_run_rtl(run: Any) -> None:
     lang.set(qn("w:bidi"), "ar-SA")
 
 
-def _rtl(paragraph: Any, text: str, size: float, *, handwritten: bool = False, bold: bool = False) -> None:
+def _rtl(paragraph: Any, text: str, size: float, *, handwritten: bool = False, bold: bool = False, text_direction: str = "auto") -> None:
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(1.5)
     paragraph.paragraph_format.line_spacing = 1.15
-    _set_paragraph_rtl(paragraph)
+    rtl = text_direction == "rtl" or (text_direction == "auto" and _uses_rtl(text))
+    (_set_paragraph_rtl if rtl else _set_paragraph_ltr)(paragraph)
     for part in ALLOWED_TAG.split(text):
         superscript = part.startswith("<sup>") and part.endswith("</sup>")
         value = part[5:-6] if superscript else re.sub(r"<[^>]+>", "", part)
@@ -152,10 +174,11 @@ def _rtl(paragraph: Any, text: str, size: float, *, handwritten: bool = False, b
         run.font.superscript = superscript
         run.font.italic = handwritten
         run.font.bold = bold
-        _set_run_rtl(run)
+        if rtl:
+            _set_run_rtl(run)
 
 
-def _rtl_rich(paragraph: Any, block: dict[str, Any], size: float, scale: float) -> None:
+def _rtl_rich(paragraph: Any, block: dict[str, Any], size: float, scale: float, *, text_direction: str = "auto") -> None:
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(1.5)
     paragraph.paragraph_format.line_spacing = 1.15
@@ -168,7 +191,11 @@ def _rtl_rich(paragraph: Any, block: dict[str, Any], size: float, scale: float) 
     list_kind = next((run.get("list") for run in block.get("runs", []) if run.get("list")), None)
     if list_kind:
         paragraph.style = "List Number" if list_kind == "ordered" else "List Bullet"
-    _set_paragraph_rtl(paragraph)
+    rtl = text_direction == "rtl" or (
+        text_direction == "auto"
+        and _uses_rtl("".join(item.get("text", "") for item in block.get("runs", [])))
+    )
+    (_set_paragraph_rtl if rtl else _set_paragraph_ltr)(paragraph)
     if block.get("separator"):
         paragraph.paragraph_format.space_before = Pt(4)
         paragraph.paragraph_format.space_after = Pt(4)
@@ -182,7 +209,7 @@ def _rtl_rich(paragraph: Any, block: dict[str, Any], size: float, scale: float) 
         paragraph._p.get_or_add_pPr().append(border)
         return
     if block.get("align"):
-        _set_paragraph_alignment(paragraph, block["align"])
+        _set_paragraph_alignment(paragraph, block["align"], rtl=rtl)
     for item in block.get("runs", []):
         run = paragraph.add_run(item.get("text", ""))
         run.font.name = item.get("font_family") or "Arial"
@@ -195,7 +222,8 @@ def _rtl_rich(paragraph: Any, block: dict[str, Any], size: float, scale: float) 
         run.font.underline = bool(item.get("underline"))
         run.font.superscript = bool(item.get("superscript"))
         run.font.subscript = bool(item.get("subscript"))
-        _set_run_rtl(run)
+        if rtl:
+            _set_run_rtl(run)
 
 
 def _page_lines(page: dict[str, Any]) -> list[dict[str, Any]]:
@@ -338,6 +366,7 @@ def build_docx(pages: list[dict[str, Any]], destination: Path, scale: float = 1.
             _rtl(section.footer.paragraphs[0], page["printed_page"], 8.5)
 
         lines = _page_lines(page)
+        text_direction = page.get("text_direction", "auto")
         rich_blocks = rich_html_blocks(page.get("content_html", "")) if page.get("content_html") else []
         page_height = page["height"] - 2 * margin - 18
         page_width = page["width"] - 2 * margin
@@ -352,12 +381,12 @@ def build_docx(pages: list[dict[str, Any]], destination: Path, scale: float = 1.
         columns = max((line["column"] for line in body), default=0) + 1
         if rich_blocks:
             for block in rich_blocks:
-                _rtl_rich(doc.add_paragraph(), block, size / scale, scale)
+                _rtl_rich(doc.add_paragraph(), block, size / scale, scale, text_direction=text_direction)
         elif not lines:
             _rtl(doc.add_paragraph(), "", 1)
         elif columns <= 1:
             for line in body:
-                _rtl(doc.add_paragraph(), line["text"], size, handwritten=line["source"] == "handwritten", bold=line["kind"] == "heading")
+                _rtl(doc.add_paragraph(), line["text"], size, handwritten=line["source"] == "handwritten", bold=line["kind"] == "heading", text_direction=text_direction)
         else:
             table = doc.add_table(rows=1, cols=columns)
             table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -373,7 +402,7 @@ def build_docx(pages: list[dict[str, Any]], destination: Path, scale: float = 1.
                     current = [{"text": "", "source": "printed", "kind": "body"}]
                 for line_index, line in enumerate(current):
                     paragraph = cell.paragraphs[0] if line_index == 0 else cell.add_paragraph()
-                    _rtl(paragraph, line["text"], size, handwritten=line["source"] == "handwritten", bold=line["kind"] == "heading")
+                    _rtl(paragraph, line["text"], size, handwritten=line["source"] == "handwritten", bold=line["kind"] == "heading", text_direction=text_direction)
             tbl_pr = table._tbl.tblPr
             borders = OxmlElement("w:tblBorders")
             for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
@@ -389,7 +418,7 @@ def build_docx(pages: list[dict[str, Any]], destination: Path, scale: float = 1.
                     for key, value in {"val": "single", "sz": "4", "space": "4", "color": "777777"}.items():
                         top.set(qn(f"w:{key}"), value)
                     border.append(top); paragraph._p.get_or_add_pPr().append(border); first = False
-                _rtl(paragraph, line["text"], size * 0.82, handwritten=line["source"] == "handwritten")
+                _rtl(paragraph, line["text"], size * 0.82, handwritten=line["source"] == "handwritten", text_direction=text_direction)
     doc.save(destination)
 
 
@@ -419,23 +448,33 @@ def export_word(
     verified = False
     used_scale = 1.0
     with EXPORT_LOCK:
-        for scale in (1.0, 0.92, 0.84, 0.76):
-            build_docx(pages, destination, scale)
-            used_scale = scale
-            if not office:
-                break
+        if not office:
+            build_docx(pages, destination)
+        else:
             with tempfile.TemporaryDirectory(prefix="waraq-word-") as temporary:
                 temp = Path(temporary)
+                candidate = temp / destination.name
                 profile = (temp / "profile").as_uri()
-                process = subprocess.run([office, f"-env:UserInstallation={profile}", "--headless", "--convert-to", "pdf", "--outdir", str(temp), str(destination)], capture_output=True, timeout=300)
-                rendered = temp / f"{destination.stem}.pdf"
-                if process.returncode != 0 or not rendered.exists():
-                    break
-                actual_pages = _pdf_page_count(rendered)
-                if actual_pages == len(pages):
-                    verified = True
-                    shutil.copy2(rendered, destination.with_suffix(".verification.pdf"))
-                    break
+                rendered = temp / f"{candidate.stem}.pdf"
+                for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.60):
+                    build_docx(pages, candidate, scale)
+                    used_scale = scale
+                    process = subprocess.run([office, f"-env:UserInstallation={profile}", "--headless", "--convert-to", "pdf", "--outdir", str(temp), str(candidate)], capture_output=True, timeout=300)
+                    if process.returncode != 0 or not rendered.exists():
+                        break
+                    actual_pages = _pdf_page_count(rendered)
+                    if actual_pages == len(pages):
+                        verified = True
+                        shutil.copy2(candidate, destination)
+                        shutil.copy2(rendered, destination.with_suffix(".verification.pdf"))
+                        break
+                    rendered.unlink()
+                if not verified:
+                    if actual_pages is not None:
+                        raise ValueError(
+                            f"تعذر الحفاظ على عدد الصفحات في Word: المتوقع {len(pages)}، والناتج {actual_pages}. اختصر النص أو راجع توزيع الصفحة."
+                        )
+                    shutil.copy2(candidate, destination)
     return _export_report(
         library,
         book,
@@ -536,10 +575,13 @@ def _html_document(book: dict[str, Any], pages: list[dict[str, Any]]) -> str:
         hidden = "" if index == 0 else " hidden"
         width = max(float(page.get("width") or 420), 1)
         height = max(float(page.get("height") or 594), 1)
+        direction = page.get("text_direction", "auto")
+        if direction not in {"rtl", "ltr"}:
+            direction = "auto"
         articles.append(
             f'<article class="book-page" data-page="{source_number}" '
             f'data-printed-page="{printed_page}" style="--page-ratio:{width}/{height}"{hidden}>'
-            f'<div class="page-content">{content}</div>'
+            f'<div class="page-content" dir="{direction}">{content}</div>'
             f'<footer class="printed-page">{printed_page}</footer>'
             "</article>"
         )
@@ -572,7 +614,7 @@ button, input {{ font: inherit; }}
 .book-stage {{ display: grid; place-items: start center; padding: clamp(18px, 4vw, 42px); }}
 .book-page {{ position: relative; width: min(820px, 94vw); aspect-ratio: var(--page-ratio); min-height: 72vh; padding: clamp(34px, 7vw, 72px); overflow: auto; background: #fff; border: 1px solid #d2ced7; box-shadow: 0 15px 40px rgba(35,29,45,.13); }}
 .book-page[hidden] {{ display: none; }}
-.page-content {{ direction: rtl; text-align: right; font-size: clamp(18px, 2.25vw, 23px); line-height: 1.75; }}
+.page-content {{ text-align: start; font-size: clamp(18px, 2.25vw, 23px); line-height: 1.75; }}
 .page-content p, .page-content h1, .page-content h2, .page-content h3, .page-content h4, .page-content h5, .page-content h6, .page-content blockquote {{ margin: 0 0 .32em; }}
 .page-content h1, .page-content h2, .page-content h3, .page-content h4, .page-content h5, .page-content h6 {{ text-align: center; line-height: 1.45; }}
 .page-content blockquote, .page-content .ql-size-small {{ margin-inline: 0; font-size: .82em; line-height: 1.65; }}

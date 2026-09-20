@@ -17,6 +17,7 @@ from .gemini_client import DEFAULT_MODEL, GeminiClient
 from .notifications import SYSTEM_SOUNDS, SYSTEM_SOUND_IDS, play_system_sound
 from .secrets import SecretStore
 from .tasks import ConversionRunner
+from .summaries import SummaryDocument, export_summary, export_summaries
 
 
 def local_path(url_or_path: str) -> Path:
@@ -55,6 +56,8 @@ class Bridge(QObject):
         self._usage: dict[str, Any] = {}
         self._quotas: list[dict[str, Any]] = []
         self._task: dict[str, Any] = {}
+        self._summaries: list[dict[str, Any]] = []
+        self._summary: dict[str, Any] = {}
         self._busy = False
         self._exporting = False
         self._toast = ""
@@ -98,6 +101,8 @@ class Bridge(QObject):
     usage = Property(dict, lambda self: self._usage, notify=stateChanged)
     quotaLimits = Property(list, lambda self: self._quotas, notify=stateChanged)
     currentTask = Property(dict, lambda self: self._task, notify=stateChanged)
+    summaries = Property(list, lambda self: self._summaries, notify=stateChanged)
+    currentSummary = Property(dict, lambda self: self._summary, notify=stateChanged)
     busy = Property(bool, lambda self: self._busy, notify=stateChanged)
     exporting = Property(bool, lambda self: self._exporting, notify=stateChanged)
     toast = Property(str, lambda self: self._toast, notify=toastChanged)
@@ -134,7 +139,107 @@ class Bridge(QObject):
                 self._book = self.library.get_book(self._book["id"])
             except KeyError:
                 self._book = {}; self._page = {}
+        self._summaries = self.library.list_summaries(self._book["id"]) if self._book else []
+        self._summary = next((record for record in self._summaries if record["id"] == self._summary.get("id")), {})
+        if not self._summary and self._summaries:
+            self._summary = self._summaries[-1]
         self.stateChanged.emit()
+
+    @Slot(str)
+    def openSummaries(self, book_id: str) -> None:
+        try:
+            if book_id:
+                self._book = self.library.get_book(book_id)
+            self._screen = "summaries"
+            self.refresh()
+        except Exception as exc:
+            self._notify(str(exc))
+
+    @Slot(str)
+    def selectSummary(self, summary_id: str) -> None:
+        self._summary = next((record for record in self._summaries if record["id"] == summary_id), {})
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def openSummarySource(self, number: int) -> None:
+        if self._summary and number in self._summary["source_pages"]:
+            self.openPage(number)
+
+    @Slot(str)
+    def reviewSummaries(self, payload: str) -> None:
+        try:
+            if self.runner.running:
+                raise RuntimeError("توجد مهمة جارية. علّقها أو ألغها قبل مراجعة الملخصات")
+            config = json.loads(payload)
+            book_id = self._book["id"]
+            records = self.library.selected_summaries(book_id, config["ids"])
+            pages = sorted({page for record in records for page in record["source_pages"]})
+            task_id = self.library.create_task(
+                book_id=book_id, start_page=min(pages), end_page=max(pages),
+                key_id=config["key_id"], model=config.get("model") or DEFAULT_MODEL,
+                prompt_id="default-summary", mode="summary", dpi=300, overwrite=False,
+                summary_ids=config["ids"],
+                review_batch_size=config.get("review_batch_size", 3),
+            )
+            self._task = self.library.task(task_id)
+            self.runner.start(task_id)
+            self._screen = "task"
+            self.refresh()
+        except Exception as exc:
+            self._notify(str(exc))
+
+    @Slot(str)
+    def deleteSummaries(self, payload: str) -> None:
+        try:
+            ids = json.loads(payload)
+            if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+                raise ValueError("قائمة الملخصات غير صالحة")
+            current = self._summary
+            self.library.delete_summaries(self._book["id"], ids)
+            remaining = self.library.list_summaries(self._book["id"])
+            self._summary = next((r for r in remaining if r["id"] == current.get("id")), {})
+            if not self._summary:
+                self._summary = next((r for r in remaining if (r["task_id"] == current.get("task_id") if current.get("input_ids") else not r["input_ids"])), {})
+            self.refresh()
+            self._notify(f"حُذف {len(ids)} ملخص. ملف PDF وسجل الاستهلاك محفوظان")
+        except Exception as exc:
+            self._notify(str(exc))
+
+    @Slot(str)
+    def deleteSummaryReview(self, task_id: str) -> None:
+        try:
+            self.library.delete_summary_review(self._book["id"], task_id)
+            self._summary = next((record for record in self._summaries if not record["input_ids"]), {})
+            self.refresh()
+            self._notify("حُذفت نتائج المراجعة. الملخصات الأصلية وسجل الاستهلاك محفوظان")
+        except Exception as exc:
+            self._notify(str(exc))
+
+    @Slot(str)
+    def exportSummary(self, destination: str) -> None:
+        try:
+            if not self._summary:
+                raise ValueError("اختر ملخصًا لعرضه أولاً")
+            path = local_path(destination)
+            export_summary(SummaryDocument.model_validate(self._summary["document"]), path)
+            self._notify("حُفظ الملخص في: " + str(path))
+        except Exception as exc:
+            self._notify(str(exc))
+
+    @Slot(str, str)
+    def exportSummaries(self, destination: str, selection: str) -> None:
+        try:
+            ids = json.loads(selection)
+            if not isinstance(ids, list) or not ids or len(set(ids)) != len(ids):
+                raise ValueError("حدد الملخصات المطلوب تصديرها")
+            records = [record for record in self._summaries if record["id"] in ids]
+            if len(records) != len(ids):
+                raise ValueError("بعض الملخصات المحددة غير موجودة في الكتاب الحالي")
+            path = local_path(destination)
+            export_summaries(records, path)
+            self._notify(f"صُدّر {len(records)} ملخصًا بكل أوراقها إلى: {path}")
+        except Exception as exc:
+            self._notify(str(exc))
 
     @staticmethod
     def _serial_requests(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -556,7 +661,7 @@ class Bridge(QObject):
     def savePrompt(self, prompt_id: str, name: str, mode: str, instructions: str) -> None:
         try:
             self.library.save_prompt(name, mode, instructions, prompt_id or None)
-            self.refresh(); self._notify("حُفظت نسخة البرومبت")
+            self.refresh(); self._notify("حُفظ البرومبت")
         except Exception as exc: self._notify(str(exc))
 
     @Slot(str)
@@ -565,13 +670,22 @@ class Bridge(QObject):
             if self.runner.running:
                 raise RuntimeError("توجد مهمة تحويل جارية. علّقها أو ألغها قبل بدء مهمة أخرى")
             config = json.loads(payload)
+            mode = config.get("mode", "printed")
+            default_prompts = {
+                "printed": "default-printed", "manuscript": "default-manuscript",
+                "translation": "default-translation", "summary": "default-summary",
+            }
             task_id = self.library.create_task(
                 book_id=config.get("book_id") or self._book["id"], start_page=int(config["start_page"]), end_page=int(config["end_page"]),
                 key_id=config["key_id"], model=config.get("model") or DEFAULT_MODEL,
-                prompt_id=config.get("prompt_id") or ("default-manuscript" if config.get("mode") == "manuscript" else "default-printed"),
-                mode=config.get("mode", "printed"), dpi=int(config.get("dpi", 300)),
+                prompt_id=config.get("prompt_id") or default_prompts.get(mode, "default-printed"),
+                mode=mode, dpi=int(config.get("dpi", 300)),
                 overwrite=bool(config.get("overwrite", False)),
                 pages_per_request=int(config.get("pages_per_request", 1)),
+                target_language=config.get("target_language", ""),
+                summary_level=config.get("summary_level", ""),
+                text_direction=config.get("text_direction", "rtl"),
+                additional_instructions=config.get("additional_instructions", ""),
             )
             self._task = self.library.task(task_id); self._screen = "task"; self.stateChanged.emit()
             self.runner.start(task_id)
@@ -627,6 +741,12 @@ class Bridge(QObject):
             return
         try:
             self._book = self.library.get_book(self._task["book_id"])
+            if self._task["mode"] == "summary" and self._task.get("summary_contract"):
+                self.openSummaries(self._task["book_id"])
+                records = [record for record in self._summaries if record["task_id"] == self._task["id"]]
+                if records:
+                    self.selectSummary(records[0 if self._task.get("summary_review_version") == 2 else -1]["id"])
+                return
             page_number = int(
                 self._task.get("current_page") or self._task.get("start_page") or 1
             )
@@ -654,6 +774,11 @@ class Bridge(QObject):
                 "failed": data.get("error", "فشل التحويل"),
                 "cancelled": "أُلغيت مهمة التحويل وبقيت الصفحات المحفوظة",
             }
+            if state == "completed" and self._task.get("summary_review_version") == 2 and self._task.get("id") == data.get("task_id"):
+                messages["completed"] = f"اكتملت مراجعة {self._task['completed']} دفعات؛ النتائج في سلسلة مراجعة مستقلة"
+                results = [record for record in self._summaries if record["task_id"] == data["task_id"]]
+                if results:
+                    self.selectSummary(results[0]["id"])
             self._notify(messages[state])
             if self._notification_sound_enabled:
                 self._play_notification_sound()

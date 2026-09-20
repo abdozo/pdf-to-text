@@ -113,6 +113,21 @@ def test_library_references_pdf_without_copying_it(library: Library, tmp_path: P
     assert "**العريض**" in printed_prompt["instructions"]
 
 
+def test_default_prompt_edit_survives_reopening_library(library: Library) -> None:
+    instructions = "تعليمات مطبوعة عدّلها المستخدم من صفحة الإعدادات."
+
+    prompt_id = library.save_prompt(
+        "المطبوعات العربية", "printed", instructions, "default-printed"
+    )
+
+    assert prompt_id == "default-printed"
+    reopened = Library(library.root)
+    prompt = next(
+        item for item in reopened.list_prompts() if item["id"] == "default-printed"
+    )
+    assert prompt["instructions"] == instructions
+
+
 def test_relinking_a_missing_pdf_preserves_existing_conversion(
     library: Library, tmp_path: Path,
 ) -> None:
@@ -481,6 +496,55 @@ def test_task_persists_the_selected_pages_per_request(library: Library, tmp_path
     assert library.task(task_id)["pages_per_request"] == 4
 
 
+def test_translation_and_summary_tasks_keep_their_page_specific_instructions(
+    library: Library, tmp_path: Path,
+) -> None:
+    book = library.add_book(make_pdf(tmp_path / "source.pdf", 2))
+    key = library.add_key("أساسي", "secret-ref")
+    prompts = {prompt["id"]: prompt for prompt in library.list_prompts()}
+    assert prompts["default-translation"]["mode"] == "translation"
+    assert prompts["default-summary"]["mode"] == "summary"
+    assert "لا تفرض سطرًا" in prompts["default-translation"]["instructions"]
+
+    translated = library.create_task(
+        book_id=book["id"], start_page=1, end_page=2, key_id=key,
+        model="gemini-test", prompt_id="default-translation", mode="translation",
+        dpi=300, overwrite=False, target_language="الفرنسية", text_direction="ltr",
+        additional_instructions="حافظ على أسماء الأعلام بالحروف الأصلية.\nلا تحذف رقم الحاشية.",
+    )
+    summarized = library.create_task(
+        book_id=book["id"], start_page=1, end_page=2, key_id=key,
+        model="gemini-test", prompt_id="default-summary", mode="summary",
+        dpi=300, overwrite=False, summary_level="strong",
+    )
+    assert library.task(translated)["target_language"] == "الفرنسية"
+    assert library.task(translated)["text_direction"] == "ltr"
+    assert "لغة الناتج المطلوبة: الفرنسية" in library.task(translated)["prompt_snapshot"]
+    assert "من اليسار إلى اليمين" in library.task(translated)["prompt_snapshot"]
+    assert library.task(translated)["additional_instructions"] == (
+        "حافظ على أسماء الأعلام بالحروف الأصلية.\nلا تحذف رقم الحاشية."
+    )
+    assert library.task(translated)["prompt_snapshot"].endswith(
+        "تعليمات إضافية من المستخدم لهذه المهمة:\n"
+        "حافظ على أسماء الأعلام بالحروف الأصلية.\nلا تحذف رقم الحاشية."
+    )
+    assert library.task(summarized)["summary_level"] == "strong"
+    assert "الخلاصة الجوهرية" in library.task(summarized)["prompt_snapshot"]
+    assert library.task(summarized)["additional_instructions"] == ""
+    extracted = result("Texte traduit")
+    library.apply_extraction(
+        book["id"], 1, extracted, extracted.model_dump_json(), text_direction="ltr"
+    )
+    assert library.get_page(book["id"], 1)["text_direction"] == "ltr"
+    assert Library(library.root).get_page(book["id"], 1)["text_direction"] == "ltr"
+    with pytest.raises(ValueError, match="البرومبت المختار"):
+        library.create_task(
+            book_id=book["id"], start_page=1, end_page=1, key_id=key,
+            model="gemini-test", prompt_id="default-printed", mode="translation",
+            dpi=300, overwrite=False, target_language="الفرنسية",
+        )
+
+
 def test_request_start_is_throttled_by_project_and_model(
     library: Library, tmp_path: Path,
 ) -> None:
@@ -667,6 +731,39 @@ def test_conversion_reads_the_pdf_from_its_original_path_without_copying(
     assert rendered_paths == [source.resolve()]
     assert source.read_bytes() == source_bytes
     assert {path.resolve() for path in tmp_path.rglob("*.pdf")} == pdfs_before_conversion
+
+
+def test_translation_runner_saves_the_selected_editor_direction(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book = library.add_book(make_pdf(tmp_path / "translation.pdf", 1))
+    secrets = MemorySecretStore()
+    secrets.set("secret-ref", "test-key")
+    key = library.add_key("المفتاح", "secret-ref")
+    task_id = library.create_task(
+        book_id=book["id"], start_page=1, end_page=1, key_id=key,
+        model="gemini-test", prompt_id="default-translation", mode="translation",
+        dpi=300, overwrite=True, target_language="الإنجليزية", text_direction="ltr",
+    )
+
+    class FakeClient:
+        def __init__(self, _key: str):
+            pass
+
+        def extract(self, _image, **_kwargs):
+            extracted = result("Translated page")
+            return SimpleNamespace(
+                page=extracted, raw=extracted.model_dump_json(), usage={}
+            )
+
+    monkeypatch.setattr("waraq.tasks.GeminiClient", FakeClient)
+    monkeypatch.setattr("waraq.tasks.render_page", lambda _path, number, _dpi: number)
+    runner = ConversionRunner(library, secrets)
+    runner.start(task_id)
+    runner.join(2)
+
+    assert library.task(task_id)["state"] == "completed"
+    assert library.get_page(book["id"], 1)["text_direction"] == "ltr"
 
 
 def test_pause_then_resume_continues_without_reconverting_saved_pages(
@@ -1025,6 +1122,50 @@ def test_word_export_is_editable_without_writing_a_json_report(library: Library,
     assert not destination.with_suffix(".report.json").exists()
 
 
+def test_word_export_rejects_a_verified_page_count_mismatch(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book = library.add_book(make_pdf(tmp_path / "source.pdf", 1))
+    library.save_page_content(book["id"], 1, "<p>نص الصفحة</p>", reviewed=True)
+    destination = tmp_path / "book.docx"
+    destination.write_bytes(b"previous export")
+    monkeypatch.setattr("waraq.exporter._office_path", lambda: "fake-office")
+    monkeypatch.setattr("waraq.exporter._pdf_page_count", lambda _path: 2)
+
+    def render_extra_page(command, **_kwargs):
+        output = Path(command[command.index("--outdir") + 1])
+        (output / "book.pdf").write_bytes(b"two pages")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("waraq.exporter.subprocess.run", render_extra_page)
+    with pytest.raises(ValueError, match="عدد الصفحات"):
+        export_word(library, book["id"], 1, 1, destination)
+    assert destination.read_bytes() == b"previous export"
+
+
+def test_translation_direction_is_used_in_word_and_html_exports(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book = library.add_book(make_pdf(tmp_path / "source.pdf", 1))
+    extracted = result("Arabic term ثم عبارة أجنبية")
+    library.apply_extraction(
+        book["id"], 1, extracted, extracted.model_dump_json(), text_direction="ltr"
+    )
+    library.save_page_content(
+        book["id"], 1, "<p>Arabic term ثم عبارة أجنبية</p>", reviewed=True
+    )
+    monkeypatch.setattr("waraq.exporter._office_path", lambda: None)
+    word = tmp_path / "translation.docx"
+    export_word(library, book["id"], 1, 1, word)
+    with ZipFile(word) as archive:
+        xml = archive.read("word/document.xml").decode("utf-8")
+    assert '<w:bidi w:val="0"/>' in xml
+
+    html = tmp_path / "translation.html"
+    export_html(library, book["id"], 1, 1, html)
+    assert '<div class="page-content" dir="ltr">' in html.read_text(encoding="utf-8")
+
+
 def test_word_export_writes_portable_rtl_paragraph_and_run_properties(
     library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1126,7 +1267,8 @@ def test_word_export_preserves_rich_editor_paragraph_alignment(
     }
     assert 'w:jc w:val="center"' in paragraphs["سطر في الوسط"]
     assert 'w:jc w:val="start"' in paragraphs["سطر على اليمين"]
-    assert 'w:jc w:val="end"' in paragraphs["Left aligned"]
+    assert 'w:jc w:val="start"' in paragraphs["Left aligned"]
+    assert 'w:bidi w:val="0"' in paragraphs["Left aligned"]
 
 
 def test_word_export_renders_horizontal_separator_and_small_footnote(

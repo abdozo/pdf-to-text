@@ -122,6 +122,35 @@ ApplicationWindow {
         }
     }
 
+    component AppPromptEditor: ScrollView {
+        id: scrollArea
+        property alias text: scrollEditor.text
+        property alias readOnly: scrollEditor.readOnly
+        property alias placeholderText: scrollEditor.placeholderText
+        property alias cursorPosition: scrollEditor.cursorPosition
+        property alias editorObjectName: scrollEditor.objectName
+
+        clip: true
+        contentWidth: availableWidth
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: readOnly ? ScrollBar.AlwaysOff : ScrollBar.AsNeeded
+        background: Rectangle {
+            radius: 10
+            color: scrollArea.readOnly ? "#f8f9fc" : themeColors.white
+            border.width: scrollEditor.activeFocus ? 2 : 1
+            border.color: scrollEditor.activeFocus ? themeColors.violet : themeColors.border
+        }
+
+        AppTextArea {
+            id: scrollEditor
+            width: scrollArea.availableWidth
+            wrapMode: TextEdit.Wrap
+            background: Rectangle {
+                color: scrollArea.readOnly ? "#f8f9fc" : themeColors.white
+            }
+        }
+    }
+
     component AppComboBox: ComboBox {
         id: combo
         implicitHeight: 42
@@ -275,7 +304,7 @@ ApplicationWindow {
     }
 
     function screenIndex(name) {
-        const names = ["library", "book", "convert", "task", "review", "usage", "requests", "settings", "export"]
+        const names = ["library", "book", "convert", "task", "review", "usage", "requests", "settings", "export", "summaries"]
         const index = names.indexOf(name)
         return index < 0 ? 0 : index
     }
@@ -680,6 +709,7 @@ ApplicationWindow {
                         model: [
                             {screen:"library", label:"الكتب", mark:"ك"},
                             {screen:"review", label:"المراجعة", mark:"ر"},
+                            {screen:"summaries", label:"الملخصات", mark:"خ"},
                             {screen:"task", label:"عمليات التحويل", mark:"ت"},
                             {screen:"usage", label:"الاستهلاك", mark:"ح"},
                             {screen:"requests", label:"سجل الطلبات", mark:"س"},
@@ -716,7 +746,7 @@ ApplicationWindow {
                         Column {
                             anchors.fill: parent; anchors.margins: 14; spacing: 6
                             Text { text: "محلي بالكامل"; color: themeColors.ink; font.weight: Font.DemiBold }
-                            Text { width: parent.width; text: "لا تغادر ملفاتك الجهاز إلا صفحات التحويل التي ترسلها إلى Gemini."; color: themeColors.muted; font.pixelSize: 11; wrapMode: Text.WordWrap }
+                            Text { width: parent.width; text: "لا يُرسل إلى Gemini إلا الصفحات أو الملخصات التي تختار معالجتها."; color: themeColors.muted; font.pixelSize: 11; wrapMode: Text.WordWrap }
                         }
                     }
                 }
@@ -827,6 +857,7 @@ ApplicationWindow {
                                         }
                                         AppButton { text: "استئناف المراجعة"; enabled: !!App.currentBook.source_available; fill: themeColors.mint; onClicked: App.openPage(App.currentBook.last_page || 1) }
                                         AppButton { text: "تحويل صفحات"; enabled: !!App.currentBook.source_available; onClicked: App.go("convert") }
+                                        GhostButton { text: "الملخصات"; onClicked: App.openSummaries(App.currentBook.id) }
                                         GhostButton { text: "تصدير"; onClicked: openExportScreen() }
                                     }
                                     Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: themeColors.border }
@@ -878,6 +909,12 @@ ApplicationWindow {
                     property string requestedModelKey: ""
                     property string preparedTaskModelId: ""
                     property bool rangePrepared: false
+                    property string selectedMode: operationBox.currentIndex === 1 ? "translation"
+                        : operationBox.currentIndex === 2 ? "summary"
+                        : manuscriptMode.checked ? "manuscript" : "printed"
+                    property var matchingPrompts: App.prompts.filter(function(prompt) {
+                        return prompt.mode === conversionScreen.selectedMode
+                    })
                     property var selectedBook: convertBook.currentIndex >= 0 && App.books[convertBook.currentIndex]
                         ? App.books[convertBook.currentIndex] : App.currentBook
                     function indexForValue(items, field, value) {
@@ -895,6 +932,10 @@ ApplicationWindow {
                     function prepareFromTask() {
                         const task = App.currentTask
                         if (!task.id) return
+                        if (task.summary_input_ids && task.summary_input_ids !== "[]") {
+                            summariesPanel.prepareReview(task)
+                            return
+                        }
                         rangePrepared = true
                         requestedModelKey = ""
                         preparedTaskModelId = task.model || ""
@@ -903,9 +944,18 @@ ApplicationWindow {
                         toPage.value = task.end_page
                         overwriteBox.checked = false
                         pagesPerRequest.value = task.pages_per_request || 1
+                        operationBox.currentIndex = task.mode === "translation" ? 1 : task.mode === "summary" ? 2 : 0
                         manuscriptMode.checked = task.mode === "manuscript"
+                        languageBox.currentIndex = indexForValue(languageBox.model, "name", task.target_language || "العربية")
+                        if (languageBox.currentIndex < 0) {
+                            languageBox.currentIndex = languageBox.model.length - 1
+                            otherLanguage.text = task.target_language || ""
+                        }
+                        directionBox.currentIndex = task.text_direction === "ltr" ? 1 : 0
+                        summaryBox.currentIndex = indexForValue(summaryBox.model, "id", task.summary_level || "medium")
+                        additionalInstructions.text = task.additional_instructions || ""
                         keyBox.currentIndex = indexForValue(App.keys, "id", task.key_id)
-                        promptBox.currentIndex = indexForValue(App.prompts, "id", task.prompt_id)
+                        promptBox.currentIndex = indexForValue(conversionScreen.matchingPrompts, "id", task.prompt_id)
                         dpiBox.currentIndex = indexForValue(dpiBox.model, "value", task.dpi)
                         App.go("convert")
                         Qt.callLater(selectPreparedTaskModel)
@@ -981,29 +1031,95 @@ ApplicationWindow {
                                         AppComboBox { id: modelBox; objectName: "conversionModelBox"; Layout.fillWidth: true; model: App.models.length ? App.models : [{id:"gemini-3.5-flash-lite", label:"Gemini 3.5 Flash Lite (500 استعلام يوميًا) · gemini-3.5-flash-lite"}]; textRole: "label" }
                                         GhostButton { text: App.busy ? "جارٍ التحديث" : "تحديث"; enabled: !App.busy && keyBox.currentIndex >= 0; onClicked: conversionScreen.loadModels(true) }
                                     }
-                                    FieldLabel { text: "طريقة القراءة" }
+                                    FieldLabel { text: "العملية" }
+                                    AppComboBox {
+                                        id: operationBox
+                                        objectName: "conversionOperationBox"
+                                        Layout.fillWidth: true
+                                        model: [{name:"نسخ النص"},{name:"ترجمة"},{name:"تلخيص"}]
+                                        textRole: "name"
+                                        onActivated: {
+                                            promptBox.currentIndex = 0
+                                            if (currentIndex === 2)
+                                                pagesPerRequest.value = Math.min(10, Math.max(1, toPage.value - fromPage.value + 1))
+                                        }
+                                    }
+                                    FieldLabel { text: "نوع الأصل"; visible: operationBox.currentIndex === 0 }
                                     RowLayout {
+                                        visible: operationBox.currentIndex === 0
                                         RadioButton { id: printedMode; text: "كتاب مطبوع"; checked: true; HoverHandler { cursorShape: Qt.PointingHandCursor } }
                                         RadioButton { id: manuscriptMode; text: "مخطوط"; HoverHandler { cursorShape: Qt.PointingHandCursor } }
                                     }
+                                    FieldLabel { text: "لغة الترجمة"; visible: operationBox.currentIndex === 1 }
+                                    AppComboBox {
+                                        id: languageBox
+                                        objectName: "translationLanguageBox"
+                                        visible: operationBox.currentIndex === 1
+                                        Layout.fillWidth: true
+                                        model: [{name:"العربية"},{name:"الإنجليزية"},{name:"الفرنسية"},{name:"الألمانية"},{name:"الإسبانية"},{name:"التركية"},{name:"الأردية"},{name:"الفارسية"},{name:"الإندونيسية"},{name:"أخرى"}]
+                                        textRole: "name"
+                                        onActivated: {
+                                            if (currentIndex < model.length - 1)
+                                                directionBox.currentIndex = ["العربية", "الأردية", "الفارسية"].includes(model[currentIndex].name) ? 0 : 1
+                                        }
+                                    }
+                                    FieldLabel { text: "اسم اللغة"; visible: operationBox.currentIndex === 1 && languageBox.currentIndex === languageBox.model.length - 1 }
+                                    AppTextField {
+                                        id: otherLanguage
+                                        objectName: "otherTranslationLanguage"
+                                        visible: operationBox.currentIndex === 1 && languageBox.currentIndex === languageBox.model.length - 1
+                                        Layout.fillWidth: true
+                                        placeholderText: "اكتب اللغة المطلوبة"
+                                    }
+                                    FieldLabel { text: "اتجاه النص"; visible: operationBox.currentIndex === 1 }
+                                    AppComboBox {
+                                        id: directionBox
+                                        objectName: "translationDirectionBox"
+                                        visible: operationBox.currentIndex === 1
+                                        Layout.fillWidth: true
+                                        model: [{id:"rtl",name:"من اليمين إلى اليسار"},{id:"ltr",name:"من اليسار إلى اليمين"}]
+                                        textRole: "name"
+                                    }
+                                    FieldLabel { text: "تفصيل الصياغة"; visible: operationBox.currentIndex === 2 }
+                                    AppComboBox {
+                                        id: summaryBox
+                                        objectName: "summaryLevelBox"
+                                        visible: operationBox.currentIndex === 2
+                                        Layout.fillWidth: true
+                                        model: [{id:"light",name:"موسع"},{id:"medium",name:"متوازن"},{id:"strong",name:"مكثف مع حفظ المعلومات"}]
+                                        textRole: "name"
+                                        currentIndex: 1
+                                    }
+                                    Text { Layout.columnSpan: 2; Layout.fillWidth: true; visible: operationBox.currentIndex === 2; wrapMode: Text.WordWrap; color: themeColors.muted; text: "ملخص موحد لكل دفعة بالأرباع الأربعة، مع إحالات PDF. يُقترح نحو 10 صفحات مترابطة في الاستعلام كي يكتمل المبحث وتتحسن دقة الاختيار. تُحفظ الملخصات مستقلة، ويمكن دمجها لاحقًا من شاشة الملخصات." }
                                     FieldLabel { text: "نسخة البرومبت" }
-                                    AppComboBox { id: promptBox; Layout.fillWidth: true; model: App.prompts; textRole: "name" }
+                                    AppComboBox { id: promptBox; objectName: "conversionPromptBox"; Layout.fillWidth: true; model: conversionScreen.matchingPrompts; textRole: "name" }
+                                    SectionTitle { text: "الإعدادات المتقدمة"; Layout.columnSpan: 2; Layout.fillWidth: true; Layout.topMargin: 12 }
                                     FieldLabel { text: "دقة الصورة" }
                                     AppComboBox { id: dpiBox; Layout.fillWidth: true; model: [{label:"200 DPI، أسرع", value:200},{label:"300 DPI، متوازن",value:300},{label:"400 DPI، أدق",value:400}]; textRole: "label"; currentIndex: 1 }
                                     FieldLabel { text: "عدد الصفحات في الاستعلام" }
                                     AppSpinBox { id: pagesPerRequest; objectName: "conversionPagesPerRequest"; Layout.fillWidth: true; from: 1; to: Math.max(1, toPage.value - fromPage.value + 1); value: 1; editable: true }
-                                    FieldLabel { text: "الصفحات المكتملة" }
-                                    CheckBox { id: overwriteBox; text: "إعادة تحويل الصفحات المكتملة داخل النطاق مع حفظ محاولاتها السابقة" }
+                                    FieldLabel { text: "الصفحات المكتملة"; visible: conversionScreen.selectedMode !== "summary" }
+                                    CheckBox { id: overwriteBox; visible: conversionScreen.selectedMode !== "summary"; text: "إعادة تحويل الصفحات المكتملة داخل النطاق مع حفظ محاولاتها السابقة" }
+                                    FieldLabel { text: "تعليمات إضافية للذكاء الاصطناعي"; Layout.alignment: Qt.AlignTop }
+                                    AppTextArea {
+                                        id: additionalInstructions
+                                        objectName: "conversionAdditionalInstructions"
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 112
+                                        wrapMode: TextEdit.Wrap
+                                        placeholderText: "تعليمات خاصة بهذه المهمة، تُضاف إلى البرومبت المختار"
+                                    }
                                 }
                             }
                             Text { Layout.fillWidth: true; text: "يرسل ورّاق صفحات الاستعلام كصور مستقلة. قد تفشل الأعداد الكبيرة إذا تجاوز النص الناتج الحد الذي يقبله النموذج."; color: themeColors.muted; wrapMode: Text.WordWrap }
                             RowLayout { Layout.fillWidth: true
-                                Text { Layout.fillWidth: true; text: overwriteBox.checked ? "سيعاد تحويل كل صفحات النطاق المحدد." : "سيتجاوز ورّاق الصفحات المكتملة ويحوّل المعلقة أو الفاشلة فقط."; color: themeColors.muted }
+                                Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: conversionScreen.selectedMode === "summary" ? "سيُلخّص النطاق كاملًا في نتائج مستقلة مع بقاء النصوص السابقة." : overwriteBox.checked ? "سيعاد تحويل كل صفحات النطاق المحدد." : "سيتجاوز ورّاق الصفحات المكتملة ويحوّل المعلقة أو الفاشلة فقط."; color: themeColors.muted }
                                 GhostButton { text: "إلغاء"; onClicked: App.go(App.currentBook.id ? "book" : "library") }
                                 AppButton {
                                     objectName: "startConversionButton"
                                     text: "بدء التحويل"
-                                    enabled: App.books.length > 0 && keyBox.currentIndex >= 0
+                                    enabled: App.books.length > 0 && keyBox.currentIndex >= 0 && promptBox.currentIndex >= 0
+                                        && (conversionScreen.selectedMode !== "translation" || languageBox.currentIndex !== languageBox.model.length - 1 || otherLanguage.text.trim().length > 0)
                                     onClicked: {
                                         const book = conversionScreen.selectedBook
                                         const key = App.keys[keyBox.currentIndex]
@@ -1012,7 +1128,8 @@ ApplicationWindow {
                                         const startPage = fromPage.commitValue()
                                         const endPage = toPage.commitValue()
                                         const requestPageCount = pagesPerRequest.commitValue()
-                                        App.startConversion(JSON.stringify({book_id:book.id,start_page:startPage,end_page:endPage,key_id:key.id,model:model.id,prompt_id:prompt.id,mode:manuscriptMode.checked?"manuscript":"printed",dpi:dpiBox.model[dpiBox.currentIndex].value,overwrite:overwriteBox.checked,pages_per_request:requestPageCount}))
+                                        const language = languageBox.currentIndex === languageBox.model.length - 1 ? otherLanguage.text.trim() : languageBox.model[languageBox.currentIndex].name
+                                        App.startConversion(JSON.stringify({book_id:book.id,start_page:startPage,end_page:endPage,key_id:key.id,model:model.id,prompt_id:prompt.id,mode:conversionScreen.selectedMode,target_language:conversionScreen.selectedMode === "translation" ? language : "",text_direction:directionBox.model[directionBox.currentIndex].id,summary_level:conversionScreen.selectedMode === "summary" ? summaryBox.model[summaryBox.currentIndex].id : "",additional_instructions:additionalInstructions.text,dpi:dpiBox.model[dpiBox.currentIndex].value,overwrite:overwriteBox.checked,pages_per_request:requestPageCount}))
                                     }
                                 }
                             }
@@ -1033,6 +1150,10 @@ ApplicationWindow {
                             : "لا توجد"
                     }
                     function taskStateLabel() {
+                        if (App.currentTask.summary_review_version === 2 && App.currentTask.state === "running" && !App.currentTask.control_action)
+                            return "جارٍ مراجعة الدفعة " + latinNumber(App.currentTask.review_current || 1) + " من " + latinNumber(App.currentTask.total || 1)
+                        if (App.currentTask.summary_contract && App.currentTask.state === "completed") return "اكتملت الملخصات"
+                        if (App.currentTask.summary_contract && App.currentTask.state === "running" && !App.currentTask.control_action) return App.currentTask.summary_input_ids !== "[]" ? "جارٍ مراجعة الملخصات المحددة" : "جارٍ تلخيص الدفعة الحالية"
                         if (App.currentTask.state === "queued") return "جارٍ تجهيز مهمة التحويل"
                         if (App.currentTask.state === "running") {
                             if (App.currentTask.control_action === "pause") return "جارٍ تعليق المهمة بعد الدفعة الحالية"
@@ -1131,7 +1252,7 @@ ApplicationWindow {
                                         }
                                     }
                                 }
-                                SectionTitle { text: "مهمة تحويل الصفحات " + latinNumber(App.currentTask.start_page) + " إلى " + latinNumber(App.currentTask.end_page) }
+                                SectionTitle { text: App.currentTask.summary_review_version === 2 ? "مراجعة ترابط الملخصات · " + latinNumber(App.currentTask.total) + " دفعات" : "مهمة تحويل الصفحات " + latinNumber(App.currentTask.start_page) + " إلى " + latinNumber(App.currentTask.end_page) }
                                 ProgressBar { Layout.fillWidth: true; from: 0; to: Math.max(1, App.currentTask.total || 1); value: App.currentTask.processed || 0 }
                                 Rectangle {
                                     id: currentBatchCard
@@ -1200,7 +1321,7 @@ ApplicationWindow {
                                     Item { Layout.fillWidth: true }
                                 }
                                 RowLayout { Layout.fillWidth: true
-                                    AppButton { visible: ["completed","completed_with_errors"].includes(App.currentTask.state) || (App.currentTask.completed || 0) > 0; text: "مراجعة الصفحة المحوّلة"; fill: themeColors.mint; onClicked: App.openTaskPage() }
+                                    AppButton { visible: ["completed","completed_with_errors"].includes(App.currentTask.state) || (App.currentTask.completed || 0) > 0; text: App.currentTask.summary_contract ? "عرض الملخصات" : "مراجعة الصفحة المحوّلة"; fill: themeColors.mint; onClicked: App.openTaskPage() }
                                     GhostButton { text: "العودة إلى الكتاب"; onClicked: App.go("book") }
                                     GhostButton { text: "عرض السجل"; onClicked: App.go("requests") }
                                     Item { Layout.fillWidth: true }
@@ -1473,11 +1594,19 @@ ApplicationWindow {
                                 }
                             } }
                             ScrollView { contentWidth:availableWidth; ColumnLayout { width:parent.width; spacing:16
-                                SectionTitle{text:"البرومبتات"} Text{text:"يمكنك تعديل تعليمات القراءة. مخطط النتيجة يبقى تحت إدارة ورّاق.";color:themeColors.muted}
-                                Repeater { model:App.prompts; delegate:Card{required property var modelData;Layout.fillWidth:true;Layout.preferredHeight:promptForm.implicitHeight+34
-                                    ColumnLayout{id:promptForm;anchors.fill:parent;anchors.margins:17;FieldLabel{text:modelData.name+(modelData.is_default?"، افتراضي":"")}AppTextArea{Layout.fillWidth:true;Layout.preferredHeight:150;text:modelData.instructions;readOnly:modelData.is_default;wrapMode:TextEdit.Wrap}Text{text:modelData.is_default?"احفظ نسخة مخصصة لتعديل هذه التعليمات.":"";color:themeColors.muted;font.pixelSize:11}}
+                                SectionTitle{text:"البرومبتات"} Text{text:"يمكنك تعديل أي برومبت وحفظه هنا. مخطط النتيجة يبقى تحت إدارة ورّاق.";color:themeColors.muted}
+                                Card{Layout.fillWidth:true;Layout.preferredHeight:260;ColumnLayout{anchors.fill:parent;anchors.margins:18;FieldLabel{text:"نسخة مخصصة جديدة"}AppTextField{id:newPromptName;objectName:"newPromptName";Layout.fillWidth:true;placeholderText:"اسم النسخة"}AppComboBox{id:newPromptMode;Layout.fillWidth:true;model:[{id:"printed",name:"نسخ مطبوع"},{id:"manuscript",name:"نسخ مخطوط"},{id:"translation",name:"ترجمة"},{id:"summary",name:"تلخيص"}];textRole:"name"}AppPromptEditor{id:newPromptText;Layout.fillWidth:true;Layout.fillHeight:true;editorObjectName:"newPromptText";placeholderText:"تعليمات المعالجة"}AppButton{text:"حفظ النسخة";onClicked:App.savePrompt("",newPromptName.text,newPromptMode.model[newPromptMode.currentIndex].id,newPromptText.text)}}}
+                                Repeater { model:App.prompts.length; delegate:Card{id:promptCard;required property int index;property var promptData:App.prompts[index];objectName:"promptCard-"+promptData.id;property bool expanded:false;Layout.fillWidth:true;Layout.preferredHeight:promptForm.implicitHeight+20
+                                    ColumnLayout{id:promptForm;anchors.fill:parent;anchors.margins:10;spacing:8
+                                        FieldLabel{text:promptData.name+(promptData.is_default?"، افتراضي":"")}
+                                        AppPromptEditor{id:promptInstructions;objectName:"promptScroll-"+promptData.id;editorObjectName:"promptInstructions-"+promptData.id;Layout.fillWidth:true;Layout.preferredHeight:promptCard.expanded?220:36;text:promptData.instructions;readOnly:!promptCard.expanded}
+                                        RowLayout{Layout.fillWidth:true
+                                            GhostButton{text:promptCard.expanded?"إخفاء التفاصيل":"تعديل البرومبت";onClicked:promptCard.expanded=!promptCard.expanded}
+                                            Item{Layout.fillWidth:true}
+                                            AppButton{objectName:"savePrompt-"+promptData.id;visible:promptCard.expanded;text:"حفظ التعديلات";enabled:promptInstructions.text.trim().length>0;onClicked:App.savePrompt(promptData.id,promptData.name,promptData.mode,promptInstructions.text)}
+                                        }
+                                    }
                                 } }
-                                Card{Layout.fillWidth:true;Layout.preferredHeight:260;ColumnLayout{anchors.fill:parent;anchors.margins:18;FieldLabel{text:"نسخة مخصصة جديدة"}AppTextField{id:newPromptName;objectName:"newPromptName";Layout.fillWidth:true;placeholderText:"اسم النسخة"}AppComboBox{id:newPromptMode;Layout.fillWidth:true;model:[{id:"printed",name:"مطبوع"},{id:"manuscript",name:"مخطوط"}];textRole:"name"}AppTextArea{id:newPromptText;objectName:"newPromptText";Layout.fillWidth:true;Layout.fillHeight:true;placeholderText:"تعليمات القراءة";wrapMode:TextEdit.Wrap}AppButton{text:"حفظ النسخة";onClicked:App.savePrompt("",newPromptName.text,newPromptMode.model[newPromptMode.currentIndex].id,newPromptText.text)}}}
                             } }
                             ColumnLayout {
                                 spacing: 16
@@ -1606,6 +1735,15 @@ ApplicationWindow {
                         }
                     }
                 } }
+                SummariesScreen {
+                    id: summariesPanel
+                    theme: themeColors
+                    onSummarizeRequested: {
+                        App.go("convert")
+                        operationBox.currentIndex = 2
+                        promptBox.currentIndex = 0
+                    }
+                }
             }
         }
     }

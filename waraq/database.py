@@ -17,8 +17,13 @@ from .markdown_text import (
     normalize_markdown_document,
     typed_lines_to_html,
 )
-from .models import DEFAULT_MANUSCRIPT_PROMPT, DEFAULT_PRINTED_PROMPT, ExtractedPage, normalize_visual_line_text
+from .models import (
+    DEFAULT_MANUSCRIPT_PROMPT, DEFAULT_PRINTED_PROMPT,
+    DEFAULT_SUMMARY_PROMPT, DEFAULT_TRANSLATION_PROMPT,
+    ExtractedPage, normalize_visual_line_text,
+)
 from .richtext import extracted_lines_to_html, regions_to_html, rich_html_lines, sanitize_rich_html
+from .summaries import SUMMARY_REVIEW_PROMPT, SummaryDocument, review_plan, author_framing
 
 
 DEFAULT_QUOTAS = {
@@ -218,6 +223,61 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE pages ADD COLUMN content_format TEXT NOT NULL DEFAULT 'html';
     ALTER TABLE pages ADD COLUMN original_content_format TEXT NOT NULL DEFAULT 'html';
     """,
+    """
+    ALTER TABLE tasks ADD COLUMN target_language TEXT NOT NULL DEFAULT '';
+    ALTER TABLE tasks ADD COLUMN summary_level TEXT NOT NULL DEFAULT '';
+    """,
+    """
+    ALTER TABLE tasks ADD COLUMN text_direction TEXT NOT NULL DEFAULT 'rtl';
+    ALTER TABLE pages ADD COLUMN text_direction TEXT NOT NULL DEFAULT 'auto';
+    """,
+    """
+    ALTER TABLE tasks ADD COLUMN additional_instructions TEXT NOT NULL DEFAULT '';
+    """,
+    """
+    ALTER TABLE tasks ADD COLUMN summary_input_ids TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE tasks ADD COLUMN summary_contract INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE summaries (
+      id TEXT PRIMARY KEY,
+      book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      start_page INTEGER NOT NULL, end_page INTEGER NOT NULL,
+      source_pages TEXT NOT NULL, document TEXT NOT NULL,
+      input_ids TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+      UNIQUE(task_id, start_page, end_page)
+    );
+    CREATE INDEX summaries_book_pages ON summaries(book_id,start_page,end_page);
+    """,
+    """
+    ALTER TABLE tasks ADD COLUMN summary_review_version INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE summaries_new (
+      id TEXT PRIMARY KEY,
+      book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      start_page INTEGER NOT NULL, end_page INTEGER NOT NULL,
+      source_pages TEXT NOT NULL, document TEXT NOT NULL,
+      input_ids TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+      review_unit INTEGER, UNIQUE(task_id,review_unit)
+    );
+    INSERT INTO summaries_new SELECT *,NULL FROM summaries;
+    DROP TABLE summaries;
+    ALTER TABLE summaries_new RENAME TO summaries;
+    CREATE INDEX summaries_book_pages ON summaries(book_id,start_page,end_page);
+    CREATE UNIQUE INDEX summaries_page_batch ON summaries(task_id,start_page,end_page)
+      WHERE review_unit IS NULL;
+    CREATE TABLE summary_review_units (
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      source_id TEXT NOT NULL,
+      target TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '',
+      result_id TEXT, PRIMARY KEY(task_id,ordinal)
+    );
+    """,
+    """
+    ALTER TABLE tasks ADD COLUMN review_batch_size INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE summary_review_units ADD COLUMN source_ids TEXT NOT NULL DEFAULT '[]';
+    """,
 )
 
 
@@ -258,20 +318,16 @@ class Library:
                 db.executescript(script)
                 db.execute("INSERT INTO schema_migrations VALUES (?, ?)", (version, utc_now()))
             now = utc_now()
-            if not db.execute("SELECT 1 FROM prompts").fetchone():
-                db.executemany(
-                    "INSERT INTO prompts VALUES (?, ?, ?, ?, 1, ?, ?)",
-                    [
-                        ("default-printed", "المطبوعات العربية", "printed", DEFAULT_PRINTED_PROMPT, now, now),
-                        ("default-manuscript", "المخطوطات", "manuscript", DEFAULT_MANUSCRIPT_PROMPT, now, now),
-                    ],
-                )
+            defaults = [
+                ("default-printed", "المطبوعات العربية", "printed", DEFAULT_PRINTED_PROMPT),
+                ("default-manuscript", "المخطوطات", "manuscript", DEFAULT_MANUSCRIPT_PROMPT),
+                ("default-translation", "ترجمة الصفحات", "translation", DEFAULT_TRANSLATION_PROMPT),
+                ("default-summary", "تلخيص الصفحات", "summary", DEFAULT_SUMMARY_PROMPT),
+            ]
             db.executemany(
-                "UPDATE prompts SET instructions=?, updated_at=? WHERE id=? AND is_default=1",
-                [
-                    (DEFAULT_PRINTED_PROMPT, now, "default-printed"),
-                    (DEFAULT_MANUSCRIPT_PROMPT, now, "default-manuscript"),
-                ],
+                "INSERT OR IGNORE INTO prompts VALUES (?, ?, ?, ?, 1, ?, ?)",
+                [(prompt_id, name, mode, instructions, now, now)
+                 for prompt_id, name, mode, instructions in defaults],
             )
             for key in db.execute("SELECT id FROM api_keys"):
                 db.executemany("""INSERT OR IGNORE INTO quota_limits
@@ -281,6 +337,7 @@ class Library:
                     for model, (rpm, tpm, rpd) in DEFAULT_QUOTAS.items()
                 ])
             db.execute("UPDATE task_pages SET state='pending', updated_at=? WHERE state='running'", (now,))
+            db.execute("UPDATE summary_review_units SET state='pending' WHERE state='running'")
             db.execute("UPDATE tasks SET state='interrupted', control_action='', current_page=NULL, error='أغلق التطبيق قبل اكتمال المهمة', updated_at=? WHERE state='running'", (now,))
             db.execute("UPDATE requests SET state='unresolved', error='أغلق التطبيق قبل وصول الرد', finished_at=? WHERE state IN ('sending','received')", (now,))
 
@@ -657,7 +714,9 @@ class Library:
             )
         return self.get_page(book_id, page_number)
 
-    def apply_extraction(self, book_id: str, page_number: int, result: ExtractedPage, raw: str, reason: str = "extraction") -> None:
+    def apply_extraction(self, book_id: str, page_number: int, result: ExtractedPage, raw: str, reason: str = "extraction", text_direction: str = "auto") -> None:
+        if text_direction not in {"auto", "rtl", "ltr"}:
+            raise ValueError("اتجاه النص غير صالح")
         now = utc_now()
         content_markdown = markdown_lines_to_document(result.content_markdown)
         content_html = typed_lines_to_html(result.lines)
@@ -677,7 +736,7 @@ class Library:
                        raw_result=?, content_html=?, original_content_html=?,
                        content_markdown=?, original_content_markdown=?,
                        content_format='markdown', original_content_format='markdown',
-                       updated_at=?
+                       text_direction=?, updated_at=?
                    WHERE id=?""",
                 (
                     result.printed_page or "",
@@ -687,6 +746,7 @@ class Library:
                     content_html,
                     content_markdown,
                     content_markdown,
+                    text_direction,
                     now,
                     page["id"],
                 ),
@@ -820,11 +880,15 @@ class Library:
             return [dict(row) for row in db.execute("SELECT * FROM prompts ORDER BY is_default DESC, created_at")]
 
     def save_prompt(self, name: str, mode: str, instructions: str, prompt_id: str | None = None) -> str:
+        if mode not in {"printed", "manuscript", "translation", "summary"}:
+            raise ValueError("وضع البرومبت غير صالح")
+        if not name.strip() or not instructions.strip():
+            raise ValueError("أدخل اسم البرومبت وتعليماته")
         now = utc_now()
         with self.transaction() as db:
             if prompt_id:
-                if db.execute("SELECT is_default FROM prompts WHERE id=?", (prompt_id,)).fetchone()[0]:
-                    raise ValueError("احفظ نسخة مخصصة بدل تعديل البرومبت الافتراضي")
+                if db.execute("SELECT 1 FROM prompts WHERE id=?", (prompt_id,)).fetchone() is None:
+                    raise ValueError("البرومبت غير موجود")
                 db.execute("UPDATE prompts SET name=?, mode=?, instructions=?, updated_at=? WHERE id=?", (name.strip(), mode, instructions.strip(), now, prompt_id))
                 return prompt_id
             prompt_id = uuid.uuid4().hex
@@ -844,6 +908,12 @@ class Library:
         dpi: int,
         overwrite: bool,
         pages_per_request: int = 1,
+        target_language: str = "",
+        summary_level: str = "",
+        text_direction: str = "rtl",
+        additional_instructions: str = "",
+        summary_ids: list[str] | None = None,
+        review_batch_size: int = 3,
     ) -> str:
         book = self.get_book(book_id)
         if start_page < 1 or end_page > book["page_count"] or start_page > end_page:
@@ -852,24 +922,77 @@ class Library:
         if pages_per_request < 1:
             raise ValueError("عدد الصفحات في الطلب يجب أن يكون صفحة واحدة على الأقل")
         pages_per_request = min(pages_per_request, end_page - start_page + 1)
+        if mode not in {"printed", "manuscript", "translation", "summary"}:
+            raise ValueError("وضع المعالجة غير صالح")
+        target_language = target_language.strip()
+        if mode == "translation" and not target_language:
+            raise ValueError("اختر لغة الترجمة")
+        if mode == "translation" and text_direction not in {"rtl", "ltr"}:
+            raise ValueError("اختر اتجاه لغة الترجمة")
+        if mode == "summary" and not summary_level:
+            summary_level = "medium"
+        if mode == "summary" and summary_level not in {"light", "medium", "strong"}:
+            raise ValueError("اختر درجة التلخيص")
+        if mode != "translation":
+            target_language = ""
+            text_direction = "rtl"
+        if mode != "summary":
+            summary_level = ""
+        if not isinstance(additional_instructions, str):
+            raise ValueError("التعليمات الإضافية يجب أن تكون نصًا")
+        additional_instructions = additional_instructions.strip()
+        review_pages = None
+        if summary_ids is not None:
+            if mode != "summary":
+                raise ValueError("مراجعة الملخصات تخص وضع التلخيص فقط")
+            records = self.selected_summaries(book_id, summary_ids)
+            review_pages = sorted({page for record in records for page in record["source_pages"]})
+            units = review_plan(records, review_batch_size)
+            start_page, end_page = min(review_pages), max(review_pages)
+            pages_per_request = len(review_pages)
         with self.connect() as db:
-            prompt = db.execute("SELECT instructions FROM prompts WHERE id=?", (prompt_id,)).fetchone()
+            prompt = db.execute("SELECT instructions,mode FROM prompts WHERE id=?", (prompt_id,)).fetchone()
             if prompt is None:
                 raise ValueError("نسخة البرومبت غير موجودة")
+            if prompt["mode"] != mode:
+                raise ValueError("البرومبت المختار لا يخص وضع المعالجة")
             if not db.execute("SELECT 1 FROM api_keys WHERE id=?", (key_id,)).fetchone():
                 raise ValueError("مفتاح Gemini غير موجود")
         task_id = uuid.uuid4().hex
         now = utc_now()
+        instructions = prompt["instructions"]
+        if mode == "translation":
+            direction_label = "من اليمين إلى اليسار" if text_direction == "rtl" else "من اليسار إلى اليمين"
+            instructions += (
+                f"\n\nلغة الناتج المطلوبة: {target_language}. ترجم إليها كل المحتوى القابل للترجمة. "
+                f"اتجاه نص الناتج: {direction_label}. اضبط محاذاة فقرات المتن بحسب هذا الاتجاه."
+            )
+        elif mode == "summary":
+            levels = {
+                "light": "صياغة موسعة تحفظ جميع المعلومات المهمة والأدلة والقيود.",
+                "medium": "صياغة متوازنة تحفظ جميع المعلومات المهمة والأدلة والقيود.",
+                "strong": "ركّز الصياغة على الخلاصة الجوهرية دون حذف أي معلومة مهمة أو دليل أو قيد.",
+            }
+            instructions += f"\n\nدرجة التلخيص: {levels[summary_level]}"
+        if summary_ids is not None:
+            instructions = SUMMARY_REVIEW_PROMPT
+        if additional_instructions:
+            instructions += (
+                "\n\nتعليمات إضافية من المستخدم لهذه المهمة:\n"
+                + additional_instructions
+            )
         with self.transaction() as db:
             db.execute(
                 """INSERT INTO tasks
                    (id,book_id,start_page,end_page,state,project_id,key_id,model,prompt_id,
                     prompt_snapshot,mode,dpi,overwrite,stop_requested,current_page,completed,
-                    failed,error,created_at,updated_at,control_action,pages_per_request)
-                   VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, 0, '', ?, ?, '', ?)""",
+                    failed,error,created_at,updated_at,control_action,pages_per_request,
+                    target_language,summary_level,text_direction,additional_instructions)
+                   VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, 0, '', ?, ?, '', ?, ?, ?, ?, ?)""",
                 (task_id, book_id, start_page, end_page, None, key_id, model,
-                 prompt_id, prompt[0], mode, dpi, int(overwrite), now, now,
-                 pages_per_request),
+                 prompt_id, instructions, mode, dpi, int(overwrite), now, now,
+                 pages_per_request, target_language, summary_level,
+                 text_direction, additional_instructions),
             )
             db.execute(
                 """INSERT INTO task_pages (task_id,page_number,state,error,updated_at)
@@ -878,9 +1001,201 @@ class Library:
                      '',?
                    FROM pages WHERE book_id=? AND number BETWEEN ? AND ?
                    ORDER BY number""",
-                (task_id, int(overwrite), now, book_id, start_page, end_page),
+                (task_id, int(overwrite or mode == "summary"), now, book_id, start_page, end_page),
             )
+            if summary_ids is not None:
+                db.execute("UPDATE tasks SET summary_input_ids=?,summary_review_version=2,review_batch_size=? WHERE id=?",
+                           (json.dumps([r["id"] for r in records]), review_batch_size, task_id))
+                db.executemany(
+                    "INSERT INTO summary_review_units(task_id,ordinal,source_id,target,source_ids) VALUES (?,?,?,?,?)",
+                    [(task_id, index, unit["source_id"], json.dumps(unit["target"], ensure_ascii=False), json.dumps(unit["source_ids"]))
+                     for index, unit in enumerate(units)],
+                )
+                db.execute("DELETE FROM task_pages WHERE task_id=?", (task_id,))
+                db.executemany(
+                    "INSERT INTO task_pages(task_id,page_number,state,error,updated_at) VALUES (?,?,'pending','',?)",
+                    [(task_id, number, now) for number in review_pages],
+                )
+            if mode == "summary":
+                db.execute("UPDATE tasks SET summary_contract=1 WHERE id=?", (task_id,))
         return task_id
+
+    def list_summaries(self, book_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM summaries WHERE book_id=? ORDER BY start_page,end_page,created_at,review_unit,id",
+                (book_id,),
+            ).fetchall()
+        return [self._summary_snapshot(row) for row in rows]
+
+    def delete_summaries(self, book_id: str, ids: list[str]) -> None:
+        """Delete exactly the selected results, never source PDF pages or usage logs."""
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError("حدد ملخصات غير مكررة للحذف")
+        with self.transaction() as db:
+            records = {row["id"]: row for row in db.execute("SELECT id,task_id FROM summaries WHERE book_id=?", (book_id,))}
+            if not set(ids) <= records.keys():
+                raise ValueError("بعض الملخصات غير موجودة أو تنتمي إلى كتاب آخر")
+            producers = {records[value]["task_id"] for value in ids}
+            stopped_dependents = set()
+            tasks = list(db.execute("SELECT * FROM tasks WHERE book_id=?", (book_id,)))
+            for task in tasks:
+                if task["id"] in producers and task["state"] == "running":
+                    raise ValueError("علّق المهمة أو ألغها قبل حذف ملخصاتها")
+                if task["state"] not in {"completed", "cancelled"} and set(ids).intersection(json.loads(task["summary_input_ids"] or "[]")):
+                    if task["state"] == "running":
+                        raise ValueError("توجد مراجعة تعمل الآن على المحدد؛ علّقها أو ألغها قبل الحذف")
+                    stopped_dependents.add(task["id"])
+            for value in ids:
+                db.execute("UPDATE summary_review_units SET result_id=NULL WHERE result_id=?", (value,))
+                db.execute("DELETE FROM summaries WHERE id=? AND book_id=?", (value, book_id))
+            # A paused/failed producer cannot resume through a deleted boundary.
+            for task_id in producers:
+                db.execute("UPDATE tasks SET state='cancelled',control_action='',current_page=NULL,error=?,updated_at=? WHERE id=? AND state NOT IN ('completed','cancelled')",
+                           ("حُذفت بعض نتائج المهمة؛ ابدأ مهمة جديدة للصفحات المتبقية", utc_now(), task_id))
+            for task_id in stopped_dependents:
+                db.execute("UPDATE tasks SET state='cancelled',control_action='',stop_requested=0,current_page=NULL,error=?,updated_at=? WHERE id=?",
+                           ("أُلغي استئناف المراجعة لأن بعض ملخصات مصدرها حُذفت", utc_now(), task_id))
+
+    def delete_summary_review(self, book_id: str, task_id: str) -> None:
+        """Remove one review's results while retaining originals and usage history."""
+        with self.transaction() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=? AND book_id=?", (task_id, book_id)).fetchone()
+            if task is None or not json.loads(task["summary_input_ids"] or "[]"):
+                raise ValueError("اختر مراجعة سابقة؛ لا يمكن حذف الملخصات الأصلية بهذا الأمر")
+            if task["state"] == "running":
+                raise ValueError("علّق المراجعة أو ألغها قبل حذف نتائجها")
+            ids = {row[0] for row in db.execute("SELECT id FROM summaries WHERE task_id=?", (task_id,))}
+            for dependent in db.execute("SELECT summary_input_ids FROM tasks WHERE book_id=? AND id<>? AND state NOT IN ('completed','cancelled')", (book_id, task_id)):
+                if ids.intersection(json.loads(dependent[0] or "[]")):
+                    raise ValueError("توجد مراجعة غير مكتملة تعتمد على هذه النتائج؛ أكملها أو ألغها أولاً")
+            db.execute("DELETE FROM summary_review_units WHERE task_id=?", (task_id,))
+            db.execute("DELETE FROM summaries WHERE task_id=?", (task_id,))
+            db.execute("UPDATE tasks SET state='cancelled',control_action='',current_page=NULL,error=?,updated_at=? WHERE id=?",
+                       ("حُذفت نتائج هذه المراجعة", utc_now(), task_id))
+
+    @staticmethod
+    def _summary_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for key in ("document", "source_pages", "input_ids"):
+            result[key] = json.loads(result[key])
+        result["title"] = result["document"]["sheets"][0]["title"]
+        result["style_warning"] = ("ملاحظة صياغية: قد تبقى عبارات سرد عن المؤلف تحتاج إلى تنقيح."
+                                   if author_framing(SummaryDocument.model_validate(result["document"])) else "")
+        result["kind"] = ("ملخص مراجع" if result.get("review_unit") is not None
+                          else "مراجعة مجمعة قديمة" if result["input_ids"] else "ملخص دفعة")
+        return result
+
+    def selected_summaries(self, book_id: str, ids: list[str]) -> list[dict[str, Any]]:
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError("اختر ملخصات غير مكررة للمراجعة")
+        records = [record for record in self.list_summaries(book_id) if record["id"] in ids]
+        if len(records) != len(ids):
+            raise ValueError("بعض الملخصات غير موجودة أو تنتمي إلى كتاب آخر")
+        # Do not merge a reviewed result with the very material it already includes.
+        all_records = {record["id"]: record for record in self.list_summaries(book_id)}
+        def ancestry(record_id: str) -> set[str]:
+            pending, seen = [record_id], set()
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(all_records.get(current, {}).get("input_ids", []))
+            return seen
+        chosen = set(ids)
+        for record in records:
+            ancestors = ancestry(record["id"])
+            if (ancestors - {record["id"]}) & chosen:
+                raise ValueError("لا تجمع نسخة مراجعة مع أصلها؛ حدد نسخة واحدة للقراءة")
+        return records
+
+    def review_units(self, task_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            units = [dict(row) for row in db.execute(
+                "SELECT * FROM summary_review_units WHERE task_id=? ORDER BY ordinal", (task_id,)
+            )]
+            for unit in units:
+                unit["target"] = json.loads(unit["target"])
+                unit["source_ids"] = json.loads(unit["source_ids"]) or [unit["source_id"]]
+                row = db.execute("SELECT document FROM summaries WHERE id=?", (unit["result_id"],)).fetchone()
+                unit["result"] = json.loads(row[0]) if row else None
+        return units
+
+    def start_review_unit(self, task_id: str, ordinal: int) -> None:
+        with self.transaction() as db:
+            changed = db.execute(
+                """UPDATE summary_review_units SET state='running',error=''
+                   WHERE task_id=? AND ordinal=? AND state='pending'
+                   AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND state='running')""",
+                (task_id, ordinal, task_id),
+            ).rowcount
+            if not changed:
+                raise RuntimeError("دفعة المراجعة ليست معلقة في مهمة جارية")
+
+    def fail_review_unit(self, task_id: str, ordinal: int, error: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE summary_review_units SET state='failed',error=? WHERE task_id=? AND ordinal=? AND state='running'",
+                (error, task_id, ordinal),
+            )
+            db.execute("UPDATE tasks SET state='failed',error=?,updated_at=? WHERE id=? AND state!='cancelled'",
+                       (error, utc_now(), task_id))
+
+    def save_review_unit(self, task_id: str, ordinal: int, document: SummaryDocument) -> str:
+        now, result_id = utc_now(), uuid.uuid4().hex
+        with self.transaction() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            unit = db.execute("SELECT * FROM summary_review_units WHERE task_id=? AND ordinal=?", (task_id, ordinal)).fetchone()
+            if task is None or task["state"] != "running" or unit is None or unit["state"] != "running":
+                raise RuntimeError("توقفت دفعة المراجعة قبل الحفظ")
+            target = json.loads(unit["target"])
+            allowed = {row[0] for row in db.execute("SELECT page_number FROM task_pages WHERE task_id=?", (task_id,))}
+            if not set(target["source_pages"]) <= set(document.source_pages) <= allowed:
+                raise ValueError("نطاق نتيجة المراجعة لا يطابق مصدرها")
+            document.check_sources(document.source_pages, allowed)
+            db.execute(
+                """INSERT INTO summaries
+                   (id,book_id,task_id,start_page,end_page,source_pages,document,input_ids,created_at,review_unit)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (result_id, task["book_id"], task_id, min(target["source_pages"]), max(target["source_pages"]),
+                 json.dumps(document.source_pages), document.model_dump_json(),
+                 json.dumps(json.loads(unit["source_ids"]) or [unit["source_id"]]), now, ordinal),
+            )
+            db.execute("UPDATE summary_review_units SET state='completed',result_id=?,error='' WHERE task_id=? AND ordinal=?",
+                       (result_id, task_id, ordinal))
+            db.execute("UPDATE tasks SET error='',updated_at=? WHERE id=?", (now, task_id))
+        return result_id
+
+    def save_summary(self, task_id: str, numbers: list[int], document: SummaryDocument) -> str:
+        """Commit a whole batch and its progress together, without touching OCR pages."""
+        document.check_sources(numbers)
+        now, summary_id = utc_now(), uuid.uuid4().hex
+        with self.transaction() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if task is None or task["mode"] != "summary":
+                raise ValueError("المهمة ليست مهمة تلخيص")
+            if task["state"] == "cancelled":
+                raise RuntimeError("أُلغيت مهمة التلخيص")
+            running = {row[0] for row in db.execute(
+                "SELECT page_number FROM task_pages WHERE task_id=? AND state='running'", (task_id,)
+            )}
+            if set(numbers) != running:
+                raise ValueError("صفحات الملخص لا تطابق الدفعة الجارية")
+            db.execute(
+                """INSERT INTO summaries
+                   (id,book_id,task_id,start_page,end_page,source_pages,document,input_ids,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (summary_id, task["book_id"], task_id, min(numbers), max(numbers),
+                 json.dumps(numbers), document.model_dump_json(), task["summary_input_ids"], now),
+            )
+            db.executemany(
+                "UPDATE task_pages SET state='completed',error='',updated_at=? WHERE task_id=? AND page_number=?",
+                [(now, task_id, number) for number in numbers],
+            )
+            db.execute("UPDATE tasks SET current_page=NULL,error='',updated_at=? WHERE id=?", (now, task_id))
+            self._sync_task_counts(db, task_id, now)
+        return summary_id
 
     def task(self, task_id: str) -> dict[str, Any]:
         with self.connect() as db:
@@ -932,6 +1247,19 @@ class Library:
         task["display_name"] = (
             f'{task.get("book_name", "")}، من صفحة {task["start_page"]} إلى {task["end_page"]}'
         )
+        if task.get("summary_review_version") == 2:
+            rows = db.execute("SELECT state,COUNT(*) FROM summary_review_units WHERE task_id=? GROUP BY state", (task["id"],)).fetchall()
+            counts = dict(rows)
+            task.update(
+                total=sum(counts.values()), completed=counts.get("completed", 0),
+                failed=counts.get("failed", 0), skipped=0,
+                remaining=counts.get("pending", 0) + counts.get("running", 0),
+                processed=counts.get("completed", 0) + counts.get("failed", 0),
+            )
+            active = db.execute("SELECT target,ordinal FROM summary_review_units WHERE task_id=? AND state='running'", (task["id"],)).fetchone()
+            task["active_pages"] = json.loads(active[0])["source_pages"] if active else []
+            task["review_current"] = active[1] + 1 if active else task["completed"]
+            task["display_name"] = "مراجعة ترابط الملخصات · " + task["display_name"]
         return task
 
     def update_task(self, task_id: str, **fields: Any) -> None:
@@ -960,6 +1288,7 @@ class Library:
             if task["state"] not in {"queued", "paused", "interrupted", "failed", "completed_with_errors"}:
                 raise RuntimeError("لا يمكن تشغيل مهمة التحويل في حالتها الحالية")
             if task["state"] in {"failed", "completed_with_errors"}:
+                db.execute("UPDATE summary_review_units SET state='pending',error='' WHERE task_id=? AND state='failed'", (task_id,))
                 db.execute(
                     "UPDATE task_pages SET state='pending',error='',updated_at=? WHERE task_id=? AND state='failed'",
                     (utc_now(), task_id),
@@ -984,6 +1313,7 @@ class Library:
                 raise RuntimeError("انتهت مهمة التحويل بالفعل")
             now = utc_now()
             if action == "cancel":
+                db.execute("UPDATE summary_review_units SET state='pending',error='' WHERE task_id=? AND state='running'", (task_id,))
                 db.execute(
                     """UPDATE task_pages SET state='pending',error='',updated_at=?
                        WHERE task_id=? AND state='running'""",
@@ -1123,6 +1453,7 @@ class Library:
             "mode": task["mode"],
             "overwrite": bool(task["overwrite"]),
             "pages_per_request": len(numbers),
+            "summary_input_ids": json.loads(task.get("summary_input_ids") or "[]"),
         }, ensure_ascii=False)
         started_at = datetime.now(timezone.utc)
         with self.transaction() as db:

@@ -31,22 +31,22 @@
     body[data-content-mode="markdown"] .html-only { display: none; }
     body[data-content-mode="markdown"] .markdown-only { display: inline-flex; }
     #editor-shell { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: hidden; }
-    #editor { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+    #editor { width: 100%; height: 100%; min-width: 0; min-height: 0; direction: rtl; }
     .tiptap {
       width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0;
       padding: 18px 20px 100px; overflow-y: auto; overflow-x: hidden;
-      overflow-wrap: break-word; word-break: normal; outline: none; direction: rtl; text-align: right;
+      overflow-wrap: break-word; word-break: normal; outline: none; direction: inherit; text-align: start;
       white-space: pre-wrap; line-height: 1.75; font-size: 18px;
       color: #18203a; caret-color: #6256d9;
     }
     .tiptap > * { max-width: 100%; margin-top: 0; margin-bottom: 0; }
     .tiptap p.is-editor-empty:first-child::before {
       content: "اكتب نص الصفحة هنا…"; color: #8a91a3;
-      float: right; height: 0; pointer-events: none;
+      float: inline-start; height: 0; pointer-events: none;
     }
     .tiptap blockquote {
-      border-right: 4px solid #6256d9; margin: 8px 0;
-      padding: 4px 14px 4px 0; color: #4a5268;
+      border-inline-start: 4px solid #6256d9; margin: 8px 0;
+      padding: 4px; padding-inline-start: 14px; color: #4a5268;
     }
     body[data-content-mode="markdown"] .tiptap h2,
     body[data-content-mode="markdown"] .tiptap h3,
@@ -56,7 +56,7 @@
     body[data-content-mode="markdown"] .tiptap blockquote {
       border: 0; margin: 0; padding: 0; color: inherit; font-size: 13px;
     }
-    .tiptap ol, .tiptap ul { padding-right: 1.5em; padding-left: 0; }
+    .tiptap ol, .tiptap ul { padding-inline-start: 1.5em; padding-inline-end: 0; }
     .tiptap li p { margin: 0; }
   </style>
 </head>

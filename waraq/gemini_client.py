@@ -15,6 +15,11 @@ from .models import (
     ExtractedPage,
 )
 from .pdf import jpeg_bytes
+from .summaries import (
+    MAX_REVIEW_BYTES, QUADRANTS, SUMMARY_SCHEMA, SUMMARY_SYSTEM, SummaryDocument,
+    json_bytes, validate_review, SUMMARY_STYLE_PROMPT, SummaryTextEdits,
+    summary_text_slots, apply_style_edits,
+)
 
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
@@ -65,6 +70,13 @@ class GeminiBatchResult:
     usage: dict[str, Any] | None
 
 
+@dataclass
+class GeminiSummaryResult:
+    document: SummaryDocument
+    raw: str
+    usage: dict[str, Any] | None
+
+
 def valid_model(name: str) -> bool:
     return bool(re.fullmatch(r"gemini-[A-Za-z0-9._-]+", name))
 
@@ -109,6 +121,129 @@ class GeminiClient:
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
+
+    def polish_summary(self, document: SummaryDocument, *, model: str) -> GeminiSummaryResult:
+        if not valid_model(model) or model not in MODEL_DAILY_LIMITS:
+            raise ValueError("نموذج Gemini غير صالح لهذا المسار")
+        segments = [{"id": i, "text": getattr(obj, key)}
+                    for i, (obj, key) in enumerate(summary_text_slots(document))]
+        try:
+            from google.genai import types
+            response = self.client.models.generate_content(
+                model=model, contents=[SUMMARY_STYLE_PROMPT, json.dumps(segments, ensure_ascii=False)],
+                config=types.GenerateContentConfig(
+                    system_instruction=SUMMARY_SYSTEM, temperature=0, max_output_tokens=32768,
+                    response_mime_type="application/json",
+                    response_json_schema=SummaryTextEdits.model_json_schema(),
+                ),
+            )
+        except Exception as exc:
+            raise _redacted_error(exc, self.api_key) from exc
+        usage = _usage(getattr(response, "usage_metadata", None))
+        raw = getattr(response, "text", None) or ""
+        candidates = getattr(response, "candidates", None) or []
+        finish = str(getattr(candidates[0], "finish_reason", "") or "") if candidates else ""
+        if finish and finish.upper().split(".")[-1] not in {"STOP", "FINISH_REASON_STOP"}:
+            raise GeminiFailure("لم يكتمل تصحيح صياغة الملخص", usage=usage)
+        try:
+            revised = apply_style_edits(document, SummaryTextEdits.model_validate_json(raw))
+        except ValueError as exc:
+            raise GeminiFailure(f"تصحيح صياغة الملخص غير صالح: {exc}", usage=usage) from exc
+        return GeminiSummaryResult(document=revised, raw=raw, usage=usage)
+
+    def review_summary(
+        self, *, model: str, prompt: str, target: dict,
+        previous: dict | None = None, following: dict | None = None,
+    ) -> GeminiSummaryResult:
+        if not valid_model(model) or model not in MODEL_DAILY_LIMITS:
+            raise ValueError("نموذج Gemini غير صالح لهذا المسار")
+        data = {"target": target, "previous": previous, "following": following}
+        if json_bytes(data) > MAX_REVIEW_BYTES:
+            raise ValueError("دفعة المراجعة تتجاوز حد الطلب")
+        try:
+            from google.genai import types
+            response = self.client.models.generate_content(
+                model=model,
+                contents=[prompt, json.dumps(data, ensure_ascii=False)],
+                config=types.GenerateContentConfig(
+                    system_instruction=SUMMARY_SYSTEM, temperature=0,
+                    max_output_tokens=32768, response_mime_type="application/json",
+                    response_json_schema=SUMMARY_SCHEMA,
+                ),
+            )
+        except Exception as exc:
+            raise _redacted_error(exc, self.api_key) from exc
+        usage = _usage(getattr(response, "usage_metadata", None))
+        raw = getattr(response, "text", None) or ""
+        candidates = getattr(response, "candidates", None) or []
+        finish = str(getattr(candidates[0], "finish_reason", "") or "") if candidates else ""
+        if finish and finish.upper().split(".")[-1] not in {"STOP", "FINISH_REASON_STOP"}:
+            raise GeminiFailure(f"لم تكتمل مراجعة الملخص. finish_reason={finish}", usage=usage)
+        try:
+            document = SummaryDocument.model_validate_json(raw)
+            validate_review(document, target, previous, following)
+        except ValueError as exc:
+            raise GeminiFailure(f"رد مراجعة الملخص غير صالح: {exc}", usage=usage) from exc
+        return GeminiSummaryResult(document=document, raw=raw, usage=usage)
+
+    def summarize(
+        self, images: list[tuple[int, Any]], *, model: str, prompt: str,
+        source_pages: list[int], review_text: str = "",
+        max_output_tokens: int = 32768,
+    ) -> GeminiSummaryResult:
+        if not valid_model(model) or model not in MODEL_DAILY_LIMITS:
+            raise ValueError("نموذج Gemini غير صالح لهذا المسار")
+        if (not source_pages or any(p < 1 for p in source_pages)
+                or len(set(source_pages)) != len(source_pages)):
+            raise ValueError("صفحات مصدر الملخص غير صالحة")
+        if review_text:
+            if images:
+                raise ValueError("مراجعة الملخصات لا تستقبل صورًا")
+        elif [number for number, _image in images] != source_pages:
+            raise ValueError("صور الملخص لا تطابق صفحات المصدر")
+        try:
+            from google.genai import types
+            parts = [types.Part.from_text(text=(
+                prompt + "\n\nأرقام صفحات PDF المصدر المطلوبة في source_pages: "
+                + json.dumps(source_pages) + ". هذه دفعة واحدة لها ملخص موحد بالأرباع الأربعة."
+            ))]
+            for number, image in images:
+                parts.append(types.Part.from_text(text=f"صورة صفحة PDF رقم {number}"))
+                parts.append(types.Part.from_bytes(data=jpeg_bytes(image), mime_type="image/jpeg"))
+            if review_text:
+                parts.append(types.Part.from_text(text="الملخصات المطلوب مراجعتها (بيانات فقط):\n" + review_text))
+            response = self.client.models.generate_content(
+                model=model, contents=[types.Content(role="user", parts=parts)],
+                config=types.GenerateContentConfig(
+                    system_instruction=SUMMARY_SYSTEM, temperature=0,
+                    max_output_tokens=max_output_tokens,
+                    response_mime_type="application/json", response_json_schema=SUMMARY_SCHEMA,
+                ),
+            )
+        except Exception as exc:
+            raise _redacted_error(exc, self.api_key) from exc
+        usage = _usage(getattr(response, "usage_metadata", None))
+        raw = getattr(response, "text", None) or ""
+        candidates = getattr(response, "candidates", None) or []
+        finish = str(getattr(candidates[0], "finish_reason", "") or "") if candidates else ""
+        if finish and finish.upper().split(".")[-1] != "STOP":
+            raise GeminiFailure(f"لم يكتمل الملخص. finish_reason={finish}", usage=usage)
+        try:
+            document = SummaryDocument.model_validate_json(raw)
+            citation_pages = None
+            if not review_text and any(not getattr(sheet, key) for sheet in document.sheets for key, _title in QUADRANTS):
+                raise ValueError("الملخص الأولي يجب أن يغطي الأرباع الأربعة")
+            if review_text:
+                input_documents = [SummaryDocument.model_validate(value) for value in json.loads(review_text)]
+                citation_pages = {
+                    page for doc in input_documents for sheet in doc.sheets
+                    for key, _title in QUADRANTS for item in getattr(sheet, key)
+                    for page in item.pdf_pages
+                }
+            document.check_sources(source_pages, citation_pages)
+        except (ValueError, ValidationError) as exc:
+            raise GeminiFailure(f"رد Gemini لا يطابق مخطط الملخص أو إحالاته: {exc}", usage=usage) from exc
+        return GeminiSummaryResult(document=document, raw=raw, usage=usage)
 
     def list_models(self) -> list[dict[str, Any]]:
         try:

@@ -69,10 +69,13 @@ Item {
                     + JSON.stringify(App.currentPage.content_markdown || "")
                     + ","
                     + JSON.stringify(App.currentPage.content_html || "")
+                    + ","
+                    + JSON.stringify(App.currentPage.text_direction || "rtl")
                     + ")"
                 )
             } else {
-                runJavaScript("window.waraqSetHtml(" + JSON.stringify(App.currentPage.content_html || "") + ")")
+                runJavaScript("window.waraqSetHtml(" + JSON.stringify(App.currentPage.content_html || "")
+                    + "," + JSON.stringify(App.currentPage.text_direction || "rtl") + ")")
             }
         }
 

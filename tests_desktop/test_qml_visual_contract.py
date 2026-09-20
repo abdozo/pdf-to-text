@@ -70,6 +70,148 @@ def _color(value) -> str:
     return QColor(value).name().lower()
 
 
+def test_summary_quadrants_source_navigation_and_manual_review(tmp_path: Path):
+    from tests_desktop.test_library import make_pdf
+    from tests_desktop.test_summaries import document
+
+    application, engine, window, bridge = _load_window(tmp_path / "library")
+    book = bridge.library.add_book(make_pdf(tmp_path / "summary.pdf", 3))
+    key = bridge.library.add_key("مفتاح المراجعة", "ref")
+    task_id = bridge.library.create_task(
+        book_id=book["id"], start_page=2, end_page=3, key_id=key,
+        model="gemini-test", prompt_id="default-summary", mode="summary",
+        dpi=72, overwrite=False,
+    )
+    bridge.library.prepare_task_run(task_id)
+    bridge.library.start_task_pages(task_id, [2, 3])
+    summary_id = bridge.library.save_summary(task_id, [2, 3], document([2, 3]))
+    bridge.openSummaries(book["id"])
+    QTest.qWait(150)
+    screen = window.findChild(QObject, "summariesScreen")
+    assert screen.property("visible")
+    def visual_items(item):
+        yield item
+        for child in item.childItems():
+            yield from visual_items(child)
+    items = {item.objectName(): item for item in visual_items(window.contentItem())}
+    quarters = [items.get(f"summaryQuadrant{i}") for i in range(4)]
+    assert all(quarter and quarter.property("visible") for quarter in quarters)
+    assert quarters[0].property("x") > quarters[1].property("x")
+    assert quarters[2].property("x") > quarters[3].property("x")
+    assert quarters[0].property("y") < quarters[2].property("y")
+    assert quarters[0].property("width") > 200
+    bridge.openSummarySource(2)
+    assert bridge.screen == "review"
+    assert bridge.currentPage["number"] == 2
+    bridge.openSummaries(book["id"])
+    screen.setProperty("selectedIds", [summary_id])
+    application.processEvents()
+    panel = window.findChild(QObject, "summarySettingsPanel")
+    toggle = window.findChild(QObject, "summarySettingsToggle")
+    entries = window.findChild(QObject, "summaryEntriesList")
+    assert not panel.property("visible")
+    collapsed_height = entries.property("height")
+    assert collapsed_height > 250
+    QMetaObject.invokeMethod(toggle, "clicked")
+    QTest.qWait(60)
+    assert panel.property("visible")
+    assert entries.property("height") < collapsed_height
+    QMetaObject.invokeMethod(toggle, "clicked")
+    QTest.qWait(60)
+    assert not panel.property("visible")
+    started = []
+    bridge.runner.start = started.append
+    button = window.findChild(QObject, "reviewSummariesButton")
+    assert button.property("enabled")
+    batch_size = window.findChild(QObject, "summaryReviewBatchSize")
+    assert batch_size.property("value") == 3
+    batch_size.property("contentItem").setProperty("text", "4")
+    QMetaObject.invokeMethod(button, "clicked")
+    application.processEvents()
+    assert len(started) == 1
+    assert bridge.screen == "task"
+    assert bridge.currentTask["review_batch_size"] == 4
+    assert json.loads(bridge.currentTask["summary_input_ids"]) == [summary_id]
+    assert len(bridge.library.list_summaries(book["id"])) == 1
+    window.close()
+
+
+def test_summary_series_selection_and_export_all_selected(tmp_path: Path):
+    from tests_desktop.test_library import make_pdf
+    from tests_desktop.test_summaries import document
+    application, engine, window, bridge = _load_window(tmp_path / "library")
+    book = bridge.library.add_book(make_pdf(tmp_path / "series.pdf", 3))
+    key = bridge.library.add_key("مفتاح", "ref")
+    def create_task(start, end, **kwargs):
+        return bridge.library.create_task(
+            book_id=book["id"], start_page=start, end_page=end, key_id=key,
+            model="gemini-test", prompt_id="default-summary", mode="summary",
+            dpi=72, overwrite=False, **kwargs,
+        )
+    originals = []
+    for number in (1, 2):
+        task_id = create_task(number, number)
+        bridge.library.prepare_task_run(task_id)
+        bridge.library.start_task_pages(task_id, [number])
+        originals.append(bridge.library.save_summary(task_id, [number], document([number], f"أصل {number}")))
+    review_id = create_task(1, 2, summary_ids=originals, review_batch_size=1)
+    bridge.library.prepare_task_run(review_id)
+    revised = []
+    for index in (0, 1):
+        bridge.library.start_review_unit(review_id, index)
+        revised.append(bridge.library.save_review_unit(review_id, index, document([index + 1], f"مراجع {index + 1}")))
+    bridge.openSummaries(book["id"])
+    bridge.selectSummary(revised[0])
+    application.processEvents()
+    screen = window.findChild(QObject, "summariesScreen")
+    assert screen.property("groupId") == review_id
+    QMetaObject.invokeMethod(window.findChild(QObject, "selectAllSummariesButton"), "clicked")
+    application.processEvents()
+    ids = screen.property("selectedIds").toVariant()
+    assert ids == revised
+    export_button = window.findChild(QObject, "exportSelectedSummariesButton")
+    assert export_button.property("text") == "تصدير المحدد (2)"
+    destination = tmp_path / "selected.md"
+    bridge.exportSummaries(str(destination), json.dumps(list(reversed(ids))))
+    text = destination.read_text()
+    assert "مراجع 1" in text and "مراجع 2" in text
+    assert "أصل 1" not in text
+    assert text.index("مراجع 1") < text.index("مراجع 2")
+    bridge.selectSummary(originals[0])
+    application.processEvents()
+    assert screen.property("groupId") == "original"
+    assert screen.property("selectedIds").toVariant() == []
+    assert window.findChild(QObject, "deleteSummaryReviewButton").property("visible")
+    bridge.library.update_task(review_id, state="completed")
+    bridge.selectSummary(revised[0])
+    application.processEvents()
+    combo = window.findChild(QObject, "summarySeriesBox")
+    popup = window.findChild(QObject, "summarySeriesBoxPopup")
+    QMetaObject.invokeMethod(popup, "open")
+    application.processEvents()
+    def descendants(item):
+        for child in item.childItems():
+            yield child
+            yield from descendants(child)
+    options = [item for item in descendants(window.contentItem()) if item.objectName().startswith("summarySeriesBoxOption")]
+    assert options
+    for option in options:
+        option.setProperty("highlighted", True)
+        application.processEvents()
+        assert _color(option.property("contentItem").property("color")) == "#18203a"
+        assert _color(option.property("background").property("color")) != "#ffffff"
+    QMetaObject.invokeMethod(popup, "close")
+    QMetaObject.invokeMethod(window.findChild(QObject, "deleteSummaryReviewButton"), "clicked")
+    application.processEvents()
+    dialog = window.findChild(QObject, "deleteSummaryReviewDialog")
+    assert dialog.property("visible")
+    QMetaObject.invokeMethod(dialog, "accepted")
+    application.processEvents()
+    assert {r["id"] for r in bridge.library.list_summaries(book["id"])} == set(originals)
+    assert screen.property("groupId") == "original"
+    window.close()
+
+
 def test_primary_sidebar_is_on_the_right(tmp_path: Path) -> None:
     application, engine, window, bridge = _load_window(tmp_path)
     candidates = [
@@ -234,6 +376,40 @@ def test_non_breaking_spaces_cannot_push_arabic_text_outside_the_editor(tmp_path
     assert bounds["textRight"] <= bounds["editorRight"]
 
 
+@pytest.mark.skipif(
+    os.environ.get("WARRAQ_DISABLE_RICH_EDITOR") == "1",
+    reason="requires the macOS WebEngine renderer",
+)
+def test_translation_page_uses_selected_direction_in_editor(tmp_path: Path) -> None:
+    from tests_desktop.test_library import make_pdf, result
+
+    application, engine, window, bridge = _load_window(tmp_path)
+    book = bridge.library.add_book(make_pdf(tmp_path / "translation.pdf", 1))
+    extracted = result("Translated text")
+    bridge.library.apply_extraction(
+        book["id"], 1, extracted, extracted.model_dump_json(), text_direction="ltr"
+    )
+    bridge.openBook(book["id"])
+    bridge.openPage(1)
+
+    editor = None
+    for _ in range(150):
+        application.processEvents()
+        editor = window.findChild(QObject, "pageRichTextEditor")
+        if editor is not None and editor.property("editorReady"):
+            break
+        QTest.qWait(20)
+    assert editor is not None and editor.property("editorReady")
+
+    for _ in range(100):
+        application.processEvents()
+        title = editor.property("title") or ""
+        if title.startswith("{") and json.loads(title).get("direction") == "ltr":
+            break
+        QTest.qWait(10)
+    assert json.loads(editor.property("title"))["direction"] == "ltr"
+
+
 def test_mirrored_arabic_editors_are_effectively_right_aligned(tmp_path: Path) -> None:
     application, engine, window, bridge = _load_window(tmp_path)
     bridge.go("settings")
@@ -252,6 +428,74 @@ def test_mirrored_arabic_editors_are_effectively_right_aligned(tmp_path: Path) -
 
     assert field.property("cursorRectangle").x() > field.property("width") * .75
     assert area.property("cursorRectangle").x() > area.property("width") * .75
+
+
+def test_default_prompt_can_be_edited_and_saved_from_settings(tmp_path: Path) -> None:
+    application, engine, window, bridge = _load_window(tmp_path)
+    bridge.go("settings")
+    settings = window.findChild(QObject, "settingsScreen")
+    settings.setProperty("tab", 1)
+    application.processEvents()
+    QTest.qWait(50)
+
+    def visual_items(item):
+        yield item
+        for child in item.childItems():
+            yield from visual_items(child)
+
+    items = {item.objectName(): item for item in visual_items(window.contentItem())}
+    card = items["promptCard-default-printed"]
+    editor = items["promptInstructions-default-printed"]
+    save = items["savePrompt-default-printed"]
+    assert editor.property("readOnly")
+
+    card.setProperty("expanded", True)
+    application.processEvents()
+    instructions = "تعليمات محفوظة من صفحة البرومبتات."
+    editor.setProperty("text", instructions)
+    assert not editor.property("readOnly")
+    assert save.property("visible")
+
+    save.clicked.emit()
+    application.processEvents()
+    prompt = next(
+        item for item in bridge.library.list_prompts()
+        if item["id"] == "default-printed"
+    )
+    assert prompt["instructions"] == instructions
+    window.close()
+
+
+def test_prompt_editor_has_its_own_vertical_scroll(tmp_path: Path) -> None:
+    application, engine, window, bridge = _load_window(tmp_path)
+    bridge.go("settings")
+    settings = window.findChild(QObject, "settingsScreen")
+    settings.setProperty("tab", 1)
+    application.processEvents()
+
+    def visual_items(item):
+        yield item
+        for child in item.childItems():
+            yield from visual_items(child)
+
+    items = {item.objectName(): item for item in visual_items(window.contentItem())}
+    card = items["promptCard-default-printed"]
+    card.setProperty("expanded", True)
+    QTest.qWait(50)
+
+    items = {item.objectName(): item for item in visual_items(window.contentItem())}
+    scroll = items["promptScroll-default-printed"]
+    assert scroll.property("contentHeight") > scroll.property("height")
+    viewport = scroll.property("contentItem")
+    position = scroll.mapToScene(
+        QPointF(scroll.property("width") / 2, scroll.property("height") / 2)
+    )
+    QTest.wheelEvent(
+        window, position, QPoint(0, -120), QPoint(), Qt.NoModifier, Qt.ScrollUpdate
+    )
+    application.processEvents()
+    assert viewport.property("contentY") > 0
+    window.close()
 
 
 def test_review_navigation_and_dynamic_conversion_label_are_explicit() -> None:
@@ -549,11 +793,13 @@ def test_conversion_commits_the_exact_typed_page_range_before_start(tmp_path: Pa
     start = window.findChild(QObject, "conversionFromPage")
     end = window.findChild(QObject, "conversionToPage")
     pages_per_request = window.findChild(QObject, "conversionPagesPerRequest")
+    additional = window.findChild(QObject, "conversionAdditionalInstructions")
     button = window.findChild(QObject, "startConversionButton")
 
     _replace_spinbox_text(application, start, "25")
     _replace_spinbox_text(application, end, "26")
     _replace_spinbox_text(application, pages_per_request, "2")
+    additional.setProperty("text", "اترك أسماء المخطوطات كما ظهرت.")
     assert button.property("enabled")
     button.clicked.emit()
     application.processEvents()
@@ -563,7 +809,23 @@ def test_conversion_commits_the_exact_typed_page_range_before_start(tmp_path: Pa
     assert bridge.currentTask["start_page"] == 25
     assert bridge.currentTask["end_page"] == 26
     assert bridge.currentTask["pages_per_request"] == 2
+    assert bridge.currentTask["additional_instructions"] == "اترك أسماء المخطوطات كما ظهرت."
+    assert bridge.currentTask["prompt_snapshot"].endswith(
+        "تعليمات إضافية من المستخدم لهذه المهمة:\nاترك أسماء المخطوطات كما ظهرت."
+    )
     assert bridge.library.page_numbers_for_task(bridge.currentTask) == [25, 26]
+
+
+def test_summary_selection_recommends_a_larger_source_frame(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    operation = window.findChild(QObject, "conversionOperationBox")
+    pages_per_request = window.findChild(QObject, "conversionPagesPerRequest")
+
+    operation.setProperty("currentIndex", 2)
+    operation.activated.emit(2)
+    application.processEvents()
+
+    assert pages_per_request.property("value") == 10
 
 
 def test_conversion_page_inputs_respond_to_increment_and_decrement(tmp_path: Path) -> None:
@@ -660,7 +922,7 @@ def test_ai_markdown_headings_are_centered_in_the_editor() -> None:
     assert 'body[data-content-mode="markdown"] .tiptap h6' in editor
     assert "{ text-align: center; }" in editor
     assert '<option value="left">يسار</option>' in editor
-    assert "window.waraqSetMarkdown = (markdown, renderedHtml = '')" in source
+    assert "window.waraqSetMarkdown = (markdown, renderedHtml = '', direction = 'rtl')" in source
     assert "'ql-align-left': ['textAlign', 'left']" in source
     assert "App.currentPage.content_html || \"\"" in rich_editor
 
@@ -705,7 +967,7 @@ def test_task_screen_has_a_centered_animated_state_and_review_return() -> None:
     assert 'objectName: "conversionBusyIndicator"' in task
     assert "running: taskScreen.conversionActive" in task
     assert "anchors.horizontalCenter: parent.horizontalCenter" in task
-    assert 'text: "مراجعة الصفحة المحوّلة"' in task
+    assert 'App.currentTask.summary_contract ? "عرض الملخصات" : "مراجعة الصفحة المحوّلة"' in task
     assert "App.openTaskPage()" in task
 
 
@@ -817,6 +1079,8 @@ def test_failed_task_can_return_to_its_settings_before_retrying(tmp_path: Path) 
         {"id": "gemini-test-alternative", "label": "نموذج بديل"},
     ]
     button = window.findChild(QObject, "startConversionButton")
+    additional = window.findChild(QObject, "conversionAdditionalInstructions")
+    additional.setProperty("text", "حافظ على المصطلح التقني.")
     button.clicked.emit()
     application.processEvents()
     task_id = bridge.currentTask["id"]
@@ -839,6 +1103,7 @@ def test_failed_task_can_return_to_its_settings_before_retrying(tmp_path: Path) 
     assert end.property("value") == bridge.currentTask["end_page"]
     assert pages_per_request.property("value") == bridge.currentTask["pages_per_request"]
     assert model.property("currentText") == "النموذج السابق"
+    assert additional.property("text") == "حافظ على المصطلح التقني."
 
     model.setProperty("currentIndex", 1)
     button.clicked.emit()
@@ -898,3 +1163,27 @@ def test_conversion_model_picker_shows_every_loaded_model(tmp_path: Path) -> Non
     picker = window.findChild(QObject, "conversionModelBox")
     assert picker.property("count") == 2
     assert not picker.property("editable")
+
+
+def test_conversion_modes_show_their_own_options_and_prompts(tmp_path: Path) -> None:
+    application, engine, window, bridge = _prepare_conversion_window(tmp_path)
+    operation = window.findChild(QObject, "conversionOperationBox")
+    language = window.findChild(QObject, "translationLanguageBox")
+    direction = window.findChild(QObject, "translationDirectionBox")
+    summary = window.findChild(QObject, "summaryLevelBox")
+    prompts = window.findChild(QObject, "conversionPromptBox")
+
+    operation.setProperty("currentIndex", 1)
+    application.processEvents()
+    assert language.property("visible")
+    assert direction.property("visible")
+    assert direction.property("count") == 2
+    assert not summary.property("visible")
+    assert prompts.property("count") == 1
+
+    operation.setProperty("currentIndex", 2)
+    application.processEvents()
+    assert summary.property("visible")
+    assert not language.property("visible")
+    assert not direction.property("visible")
+    assert prompts.property("count") == 1

@@ -52,7 +52,7 @@ const editor = new Editor({
     TextAlign.configure({
       types: ['heading', 'paragraph'],
       alignments: ['right', 'center', 'left', 'justify'],
-      defaultAlignment: 'right'
+      defaultAlignment: null
     })
   ],
   content: '<p></p>',
@@ -118,6 +118,16 @@ fontSize.addEventListener('change', () => {
 const alignment = document.querySelector('#alignment')
 alignment.addEventListener('change', () => run(chain => chain.setTextAlign(alignment.value)))
 
+window.waraqSetDirection = value => {
+  const direction = value === 'ltr' ? 'ltr' : 'rtl'
+  const attributes = { ...editor.options.editorProps.attributes, dir: direction }
+  editor.setOptions({ editorProps: { ...editor.options.editorProps, attributes } })
+  document.querySelector('#editor').dir = direction
+  alignment.value = direction === 'ltr' ? 'left' : 'right'
+  updateToolbar()
+  requestAnimationFrame(() => requestAnimationFrame(publishLayoutMetrics))
+}
+
 document.querySelector('#text-color').addEventListener('input', event => {
   run(chain => chain.setColor(event.target.value))
 })
@@ -139,7 +149,8 @@ function updateToolbar() {
   const attributes = editor.getAttributes('textStyle')
   fontFamily.value = attributes.fontFamily || ''
   fontSize.value = attributes.fontSize || ''
-  alignment.value = ['center', 'left', 'justify'].find(value => editor.isActive({ textAlign: value })) || 'right'
+  alignment.value = ['center', 'left', 'right', 'justify'].find(value => editor.isActive({ textAlign: value }))
+    || (document.querySelector('#editor').dir === 'ltr' ? 'left' : 'right')
 }
 
 const publishLayoutMetrics = () => {
@@ -155,6 +166,7 @@ const publishLayoutMetrics = () => {
     editorRight: editorBounds.right,
     textLeft: textBounds.left,
     textRight: textBounds.right,
+    direction: getComputedStyle(root).direction,
     hasNonBreakingSpace: editor.getHTML().includes('\u00a0')
   })
 }
@@ -172,16 +184,17 @@ const setContentMode = mode => {
   document.body.dataset.contentMode = contentMode
 }
 
-window.waraqSetHtml = html => {
+window.waraqSetHtml = (html, direction = 'rtl') => {
   clearTimeout(timer)
   timer = null
   setContentMode('html')
   editor.commands.setContent(normalizeLegacyHtml(html), { emitUpdate: false })
   resetEditorState()
+  window.waraqSetDirection(direction)
   updateToolbar()
   requestAnimationFrame(() => requestAnimationFrame(publishLayoutMetrics))
 }
-window.waraqSetMarkdown = (markdown, renderedHtml = '') => {
+window.waraqSetMarkdown = (markdown, renderedHtml = '', direction = 'rtl') => {
   clearTimeout(timer)
   timer = null
   setContentMode('markdown')
@@ -194,6 +207,7 @@ window.waraqSetMarkdown = (markdown, renderedHtml = '') => {
     })
   }
   resetEditorState()
+  window.waraqSetDirection(direction)
   updateToolbar()
   requestAnimationFrame(() => requestAnimationFrame(publishLayoutMetrics))
 }

@@ -11,7 +11,7 @@ python_path = @PYTHON_PATH@
 packages = Nuitka==4.1.1,ordered-set,zstandard
 
 [qt]
-qml_files = waraq/qml/Main.qml,waraq/qml/RichEditor.qml
+qml_files = waraq/qml/Main.qml,waraq/qml/RichEditor.qml,waraq/qml/SummariesScreen.qml
 excluded_qml_plugins = QtCharts,QtQuick3D,QtSensors,QtTest
 modules = Core,Gui,Network,OpenGL,Qml,QmlMeta,QmlModels,QmlWorkerScript,Quick,QuickControls2,QuickTemplates2,WebChannel,WebEngineCore,WebEngineQuick
 plugins = accessiblebridge,generic,iconengines,imageformats,networkaccess,networkinformation,platforminputcontexts,platforms,platformthemes,qmllint,qmltooling,scenegraph,styles,tls

@@ -37,8 +37,8 @@ def test_extraction_schema_uses_compact_typed_lines():
 def test_printed_extraction_contract_covers_small_notes_and_visible_separators():
     description = EXTRACTION_SCHEMA["properties"]["lines"]["description"]
 
-    assert "typed source line" in description
-    assert "physical text row" in description
+    assert "transcription prompt" in description
+    assert "translation and summary prompts" in description
     assert '"type":"hr","align":"center","md":""' in DEFAULT_PRINTED_PROMPT
     assert '"type":"note","align":"right"' in DEFAULT_PRINTED_PROMPT
     assert "Markdown داخل md" in DEFAULT_PRINTED_PROMPT
@@ -139,8 +139,8 @@ def test_markdown_extraction_rejects_html_tags():
         )
 
 
-def test_markdown_extraction_rejects_multiple_source_rows_in_one_item():
-    with pytest.raises(ValueError, match="one source row"):
+def test_markdown_extraction_rejects_line_breaks_inside_one_block():
+    with pytest.raises(ValueError, match="single text block"):
         ExtractedPage(
             is_blank=False,
             printed_page="١",
